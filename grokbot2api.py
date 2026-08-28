@@ -718,7 +718,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--client-version", default="0.30.0")
     parser.add_argument("--namespace", default="prod")
     parser.add_argument("--team-id", default="")
-    parser.add_argument("--timeout-ms", type=int, default=120000)
+    parser.add_argument("--timeout-ms", type=int, default=600000)
     parser.add_argument(
         "--api-key-env",
         default="GROK_BUILD_PROXY_API_KEY",

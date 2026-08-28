@@ -129,7 +129,7 @@ Use an appropriate permission mode for your environment. `bypassPermissions` is 
 --cache PATH              Short-lived access-token cache
 --max-mode                Enable max mode when the account supports it
 --conversation-id ID      Override the upstream conversation ID
---timeout-ms MS           Upstream timeout (default: 120000)
+--timeout-ms MS           Upstream timeout (default: 600000)
 --api-key-env NAME        Environment variable used to protect the local proxy
 ```
 
