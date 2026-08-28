@@ -47,7 +47,7 @@ model = "grok-4.6"
 base_url = "http://127.0.0.1:8765/v1"
 api_backend = "chat_completions"
 api_key = "local-only"
-context_window = 128000
+context_window = 256000
 ```
 
 To make it the default model, also add:
@@ -62,6 +62,10 @@ Verify that Grok Build sees the model:
 ```bash
 grok models
 ```
+
+### Context window
+
+Cursor documents Cursor Grok 4.6 with a 256K context window. This differs from the 500K window advertised for `grok-4.6` on xAI's direct API; `grokbot2api` uses Cursor's inference route, so the configuration uses `256000`. System instructions, tool schemas, reasoning, conversation history, and tool results all consume part of that window.
 
 ## Start the proxy
 
