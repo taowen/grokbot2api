@@ -33,10 +33,17 @@ DEFAULT_UPSTREAM_SCRIPT = Path(__file__).with_name("sand_inference.py")
 DEFAULT_CACHE = Path("/tmp/grokbot2api-token.json")
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 STREAM_HEARTBEAT_SECONDS = 1.0
+TOOL_CALL_ID_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
 
 
 class ClientDisconnected(Exception):
     """The HTTP client closed the socket while a response was being written."""
+
+
+def normalize_tool_call_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    normalized = "".join(character if character in TOOL_CALL_ID_SAFE_CHARS else "_" for character in raw)
+    return normalized[:240]
 
 
 def load_upstream(path: Path) -> ModuleType:
@@ -134,9 +141,9 @@ def tool_name_index(messages: list[Any]) -> dict[str, str]:
             if not isinstance(call, dict):
                 continue
             function = call.get("function") if isinstance(call.get("function"), dict) else call
-            call_id = call.get("id")
+            call_id = normalize_tool_call_id(call.get("id"))
             name = function.get("name")
-            if isinstance(call_id, str) and isinstance(name, str):
+            if call_id and isinstance(name, str):
                 names[call_id] = name
     return names
 
@@ -154,7 +161,7 @@ def encode_native_message(upstream: ModuleType, message: dict[str, Any], known_t
             if not isinstance(call, dict):
                 continue
             function = call.get("function") if isinstance(call.get("function"), dict) else call
-            call_id = str(call.get("id") or "")
+            call_id = normalize_tool_call_id(call.get("id"))
             name = str(function.get("name") or "")
             raw_args = function.get("arguments", "{}")
             if not isinstance(raw_args, str):
@@ -169,7 +176,7 @@ def encode_native_message(upstream: ModuleType, message: dict[str, Any], known_t
             tool_call += upstream.pb_str(4, raw_args)
             body += upstream.pb_msg(4, tool_call)
     elif role == "tool":
-        call_id = str(message.get("tool_call_id") or "")
+        call_id = normalize_tool_call_id(message.get("tool_call_id"))
         name = str(message.get("name") or known_tools.get(call_id, ""))
         result = content_text(message.get("content"))
         result_part = upstream.pb_str(1, call_id) + upstream.pb_str(2, name)
@@ -312,7 +319,7 @@ def decode_native_response(upstream: ModuleType, raw: bytes, status: int, reques
 
         for part_raw in outer.get(2, []):
             part, _ = upstream.pb_decode(part_raw)
-            call_id = first_text(part, 1)
+            call_id = normalize_tool_call_id(first_text(part, 1))
             name = first_text(part, 2)
             args_delta = first_text(part, 3)
             is_complete = bool(first_int(part, 4))

@@ -100,6 +100,29 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertEqual(call["function"]["name"], "run_terminal_command")
         self.assertEqual(json.loads(call["function"]["arguments"]), {"command": "pwd"})
 
+    def test_normalizes_native_tool_call_ids_for_http_clients(self):
+        unsafe_id = "call-123\nfc_456\r\nnext"
+        complete = upstream.pb_msg(
+            2,
+            upstream.pb_str(1, unsafe_id)
+            + upstream.pb_str(2, "run_terminal_command")
+            + upstream.pb_str(3, '{"command":"pwd"}')
+            + upstream.pb_bool(4, True),
+        )
+
+        result = bridge.decode_native_response(
+            upstream,
+            upstream.connect_envelope(complete),
+            200,
+            "request-safe-id",
+            "grok-4.6",
+        )
+
+        call_id = result["tool_calls"][0]["id"]
+        self.assertEqual(call_id, "call-123_fc_456__next")
+        self.assertNotIn("\n", call_id)
+        self.assertNotIn("\r", call_id)
+
     def test_decodes_text_and_usage(self):
         text = upstream.pb_msg(1, upstream.pb_str(1, "hello"))
         usage = upstream.pb_msg(
