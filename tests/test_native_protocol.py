@@ -106,12 +106,25 @@ class NativeProtocolTests(unittest.TestCase):
             3,
             upstream.pb_var(1, 12) + upstream.pb_var(2, 3) + upstream.pb_var(3, 15),
         )
-        raw = upstream.connect_envelope(text) + upstream.connect_envelope(usage)
+        extended_usage = upstream.pb_msg(
+            5,
+            upstream.pb_var(1, 12)
+            + upstream.pb_var(2, 3)
+            + upstream.pb_var(3, 8)
+            + upstream.pb_var(5, 256000),
+        )
+        raw = (
+            upstream.connect_envelope(text)
+            + upstream.connect_envelope(usage)
+            + upstream.connect_envelope(extended_usage)
+        )
 
         result = bridge.decode_native_response(upstream, raw, 200, "request-2", "grok-4.6")
 
         self.assertEqual(result["text"], "hello")
         self.assertEqual(result["usage"]["total_tokens"], 15)
+        self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], 8)
+        self.assertEqual(result["extended_usage"]["context_window"], 256000)
 
     def test_schema_hint_is_compact(self):
         hint = bridge.schema_argument_hint(

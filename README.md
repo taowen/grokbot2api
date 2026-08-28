@@ -135,6 +135,15 @@ Use an appropriate permission mode for your environment. `bypassPermissions` is 
 
 Run `./grokbot2api.py --help` for the complete list.
 
+Successful completions log native token telemetry when Cursor supplies it:
+
+```text
+native response finish=stop tool_calls=0 prompt_tokens=516 completion_tokens=310 cached_tokens=384 context_window=256000
+```
+
+`cached_tokens` greater than zero confirms a server-side prompt-cache hit. See
+[the protocol guide](docs/protocol.md#extended-usage) for the observed wire fields.
+
 ## Protecting the local endpoint
 
 The server binds to `127.0.0.1` by default. To require a bearer token even on loopback:

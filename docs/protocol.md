@@ -313,6 +313,25 @@ message InferenceUsageInfo {
 
 Usage defaults to zero when the upstream stream does not include this message.
 
+### Extended usage
+
+The following fields were confirmed against live Cursor Grok 4.6 responses:
+
+```protobuf
+message InferenceExtendedUsageInfo {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 cached_prompt_tokens = 3;
+  // Field 4 has not been observed and remains undocumented.
+  int32 context_window = 5;
+}
+```
+
+The bridge exposes field 3 as
+`usage.prompt_tokens_details.cached_tokens` in non-streaming Chat Completions
+responses. Both streaming and non-streaming requests log prompt, completion,
+cached, and context-window counters when the native response provides them.
+
 ### Errors
 
 Typed stream errors arrive in field 8. Connect-level errors may instead appear in the final trailer:

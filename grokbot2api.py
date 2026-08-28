@@ -255,6 +255,16 @@ def first_int(fields: dict[int, list[Any]], field: int, default: int = 0) -> int
     return int(values[0]) if values else default
 
 
+def decode_extended_usage(upstream: ModuleType, raw: bytes) -> dict[str, int]:
+    fields, _ = upstream.pb_decode(raw)
+    return {
+        "prompt_tokens": first_int(fields, 1),
+        "completion_tokens": first_int(fields, 2),
+        "cached_prompt_tokens": first_int(fields, 3),
+        "context_window": first_int(fields, 5),
+    }
+
+
 def decode_native_response(upstream: ModuleType, raw: bytes, status: int, request_id: str, model: str) -> dict[str, Any]:
     if status != 200:
         return {
@@ -270,6 +280,7 @@ def decode_native_response(upstream: ModuleType, raw: bytes, status: int, reques
     errors: list[str] = []
     response_model = model
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    extended_usage: dict[str, int] = {}
     pending: dict[str, dict[str, Any]] = {}
     completed_calls: list[dict[str, Any]] = []
     envelopes = upstream.iter_envelopes_from_bytes(raw)
@@ -337,6 +348,9 @@ def decode_native_response(upstream: ModuleType, raw: bytes, status: int, reques
                 "total_tokens": first_int(info, 3, prompt_tokens + completion_tokens),
             }
 
+        for usage_raw in outer.get(5, []):
+            extended_usage = decode_extended_usage(upstream, usage_raw)
+
         for info_raw in outer.get(4, []):
             info, _ = upstream.pb_decode(info_raw)
             response_model = first_text(info, 2) or response_model
@@ -347,6 +361,16 @@ def decode_native_response(upstream: ModuleType, raw: bytes, status: int, reques
         for error_raw in outer.get(8, []):
             error, _ = upstream.pb_decode(error_raw)
             errors.append(first_text(error, 1) or repr(error))
+
+    if extended_usage:
+        prompt_tokens = usage["prompt_tokens"] or extended_usage["prompt_tokens"]
+        completion_tokens = usage["completion_tokens"] or extended_usage["completion_tokens"]
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": usage["total_tokens"] or prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": extended_usage["cached_prompt_tokens"]},
+        }
 
     return {
         "ok": not errors,
@@ -360,6 +384,7 @@ def decode_native_response(upstream: ModuleType, raw: bytes, status: int, reques
         "error": errors[0] if errors else None,
         "envelopes": len(envelopes),
         "usage": usage,
+        "extended_usage": extended_usage,
     }
 
 
@@ -575,7 +600,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             raise RuntimeError(str(result.get("error") or f"upstream HTTP {result.get('httpStatus')}"))
 
         finish_reason = "tool_calls" if calls else "stop"
-        self.log_message("native response finish=%s tool_calls=%d", finish_reason, len(calls))
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+        extended = result.get("extended_usage") if isinstance(result.get("extended_usage"), dict) else {}
+        self.log_message(
+            "native response finish=%s tool_calls=%d prompt_tokens=%d completion_tokens=%d cached_tokens=%d context_window=%d",
+            finish_reason,
+            len(calls),
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            details.get("cached_tokens", 0),
+            extended.get("context_window", 0),
+        )
 
         message: dict[str, Any] = {"role": "assistant", "content": content}
         if calls:
@@ -588,7 +624,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "created": created,
                 "model": model,
                 "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": result.get("usage") or {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
             },
         )
 
@@ -684,7 +724,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         finish_reason = "tool_calls" if calls else "stop"
-        self.log_message("native response finish=%s tool_calls=%d", finish_reason, len(calls))
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+        extended = result.get("extended_usage") if isinstance(result.get("extended_usage"), dict) else {}
+        self.log_message(
+            "native response finish=%s tool_calls=%d prompt_tokens=%d completion_tokens=%d cached_tokens=%d context_window=%d",
+            finish_reason,
+            len(calls),
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            details.get("cached_tokens", 0),
+            extended.get("context_window", 0),
+        )
 
         if calls:
             deltas = []
