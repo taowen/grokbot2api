@@ -13,7 +13,7 @@ The following layers are public standards:
 - Connect protocol streaming envelopes
 - Protocol Buffers wire encoding
 - Google protobuf `Struct` and `Value`
-- OpenAI Chat Completions and SSE at the local edge
+- OpenAI Responses, Chat Completions, and SSE at the local edge
 
 The following pieces are Cursor-specific and private:
 
@@ -370,7 +370,35 @@ messages=6  tool_results=1  -> tool_calls=1
 messages=8  tool_results=2  -> finish=stop
 ```
 
-## Local SSE behavior
+## Local OpenAI-compatible APIs
+
+The local server accepts both `POST /v1/responses` and
+`POST /v1/chat/completions`. Both routes produce the same native Cursor
+protobuf request; the difference is limited to the local request and response
+representation.
+
+For the Responses API, message items, `function_call` items, and
+`function_call_output` items are converted into native core messages. Function
+tools use the Responses top-level `name`, `description`, and `parameters`
+shape. Streaming responses emit typed events including:
+
+- `response.created`
+- `response.output_item.added`
+- `response.output_text.delta` and `response.output_text.done`
+- `response.function_call_arguments.delta` and `.done`
+- `response.output_item.done`
+- `response.completed`
+
+The bridge accepts `previous_response_id` and retains a bounded in-memory
+history for clients that send only incremental input. Grok Build currently
+sends the complete input history on each observed request, so this state is a
+compatibility fallback rather than a requirement for normal tool loops.
+
+Native cached prompt tokens are exposed as
+`usage.input_tokens_details.cached_tokens` in Responses objects and as
+`usage.prompt_tokens_details.cached_tokens` in Chat Completions objects.
+
+## Local Chat Completions SSE behavior
 
 The helper currently buffers the complete upstream Connect response. To prevent Grok Build from timing out while waiting, the local server:
 

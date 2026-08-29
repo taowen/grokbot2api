@@ -28,22 +28,14 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
+from api_common import ClientDisconnected, content_text, normalize_tool_call_id
+from responses_api import ResponsesApiMixin
+
 
 DEFAULT_UPSTREAM_SCRIPT = Path(__file__).with_name("sand_inference.py")
 DEFAULT_CACHE = Path("/tmp/grokbot2api-token.json")
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 STREAM_HEARTBEAT_SECONDS = 1.0
-TOOL_CALL_ID_SAFE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:")
-
-
-class ClientDisconnected(Exception):
-    """The HTTP client closed the socket while a response was being written."""
-
-
-def normalize_tool_call_id(value: Any) -> str:
-    raw = str(value or "").strip()
-    normalized = "".join(character if character in TOOL_CALL_ID_SAFE_CHARS else "_" for character in raw)
-    return normalized[:240]
 
 
 def load_upstream(path: Path) -> ModuleType:
@@ -58,25 +50,6 @@ def load_upstream(path: Path) -> ModuleType:
     return module
 
 
-def content_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return json.dumps(content, ensure_ascii=False)
-    parts: list[str] = []
-    for part in content:
-        if isinstance(part, str):
-            parts.append(part)
-        elif isinstance(part, dict):
-            if part.get("type") in {"text", "input_text", "output_text"}:
-                parts.append(str(part.get("text", "")))
-            elif part.get("type") in {"image_url", "input_image"}:
-                parts.append("[image input omitted by local adapter]")
-            else:
-                parts.append(json.dumps(part, ensure_ascii=False))
-    return "\n".join(parts)
 
 
 def encode_proto_value(upstream: ModuleType, value: Any) -> bytes:
@@ -506,11 +479,29 @@ class ProxyServer(ThreadingHTTPServer):
         super().__init__(address, ProxyHandler)
         self.backend = backend
         self.api_key = api_key
+        self.response_history: dict[str, list[dict[str, Any]]] = {}
+        self.response_history_order: list[str] = []
+        self.response_history_lock = threading.Lock()
+
+    def response_messages(self, response_id: Any) -> list[dict[str, Any]]:
+        if not isinstance(response_id, str) or not response_id:
+            return []
+        with self.response_history_lock:
+            return [dict(message) for message in self.response_history.get(response_id, [])]
+
+    def remember_response(self, response_id: str, messages: list[dict[str, Any]]) -> None:
+        with self.response_history_lock:
+            self.response_history[response_id] = [dict(message) for message in messages]
+            self.response_history_order.append(response_id)
+            while len(self.response_history_order) > 128:
+                expired = self.response_history_order.pop(0)
+                self.response_history.pop(expired, None)
 
 
-class ProxyHandler(BaseHTTPRequestHandler):
+class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
     server: ProxyServer
     protocol_version = "HTTP/1.1"
+    stream_heartbeat_seconds = STREAM_HEARTBEAT_SECONDS
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[{self.log_date_time_string()}] {fmt % args}\n")
@@ -555,17 +546,27 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_json(401, {"error": {"message": "invalid API key", "type": "authentication_error"}})
             return
         path = self.path.split("?", 1)[0].rstrip("/")
-        if path not in {"/v1/chat/completions", "/chat/completions"}:
-            self.send_json(404, {"error": {"message": "only /v1/chat/completions is supported"}})
+        chat_path = path in {"/v1/chat/completions", "/chat/completions"}
+        responses_path = path in {"/v1/responses", "/responses"}
+        if not chat_path and not responses_path:
+            self.send_json(
+                404,
+                {"error": {"message": "only /v1/chat/completions and /v1/responses are supported"}},
+            )
             return
         try:
             size = int(self.headers.get("Content-Length", "0"))
             if size <= 0 or size > MAX_REQUEST_BYTES:
                 raise ValueError("invalid or oversized request body")
             request = json.loads(self.rfile.read(size))
-            if not isinstance(request, dict) or not isinstance(request.get("messages"), list):
-                raise ValueError("messages must be an array")
-            self.handle_completion(request)
+            if not isinstance(request, dict):
+                raise ValueError("request body must be an object")
+            if chat_path:
+                if not isinstance(request.get("messages"), list):
+                    raise ValueError("messages must be an array")
+                self.handle_completion(request)
+            else:
+                self.handle_response(request)
         except (ValueError, json.JSONDecodeError) as exc:
             try:
                 self.send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})

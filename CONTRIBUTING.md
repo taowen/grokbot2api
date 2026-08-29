@@ -8,7 +8,7 @@ Contributions are welcome.
 git clone https://github.com/taowen/grokbot2api.git
 cd grokbot2api
 python3 -m unittest discover -s tests -v
-python3 -m py_compile grokbot2api.py sand_inference.py
+python3 -m py_compile grokbot2api.py responses_api.py api_common.py sand_inference.py
 ```
 
 The runtime must remain dependency-free unless a dependency provides a clear interoperability or security benefit.

@@ -1,6 +1,6 @@
 # grokbot2api
 
-`grokbot2api` is a local compatibility proxy that lets [Grok Build](https://github.com/xai-org/grok-build) use Cursor-hosted Grok models through an OpenAI-compatible Chat Completions endpoint.
+`grokbot2api` is a local compatibility proxy that lets [Grok Build](https://github.com/xai-org/grok-build) use Cursor-hosted Grok models through OpenAI-compatible Responses and Chat Completions endpoints.
 
 It translates Grok Build requests into Cursor's undocumented `aiserver.v1.InferenceService.Stream` protobuf messages. Messages, native tool calls, tool results, and multi-turn state are preserved across the bridge.
 
@@ -9,7 +9,7 @@ It translates Grok Build requests into Cursor's undocumented `aiserver.v1.Infere
 
 ## Features
 
-- OpenAI-compatible `POST /v1/chat/completions`
+- OpenAI-compatible `POST /v1/responses` and `POST /v1/chat/completions`
 - Native Cursor protobuf tool calls and tool results
 - Multi-turn Grok Build agent loops
 - Streaming SSE responses with heartbeats
@@ -45,7 +45,7 @@ Add the following model entry to `~/.grok/config.toml`:
 name = "Cursor Grok 4.6 via grokbot2api"
 model = "grok-4.6"
 base_url = "http://127.0.0.1:8765/v1"
-api_backend = "chat_completions"
+api_backend = "responses"
 api_key = "local-only"
 context_window = 256000
 ```
@@ -163,7 +163,7 @@ The proxy refuses to bind to a non-loopback address unless the selected API-key 
 
 ```text
 Grok Build
-  OpenAI Chat Completions + SSE
+  OpenAI Responses or Chat Completions + SSE
         |
         v
 grokbot2api
@@ -186,9 +186,9 @@ See [docs/protocol.md](docs/protocol.md) for the wire-format reference.
 - The Cursor inference API and protobuf schema are private and undocumented.
 - `grok-4.6` currently rejects a present `InferenceAgentTool.parameters` protobuf field with provider status 422. The proxy omits that field and appends a compact argument signature to each native tool description. Tool calls and results still use native protobuf messages.
 - Upstream responses are buffered by the helper before they are converted to SSE. Heartbeats keep Grok Build's connection alive, but token deltas are not forwarded in real time.
-- Image content in Chat Completions messages is not currently forwarded.
+- Image content in Responses or Chat Completions messages is not currently forwarded.
 - Token usage may be reported as zero when the private endpoint omits usage frames.
-- Only Chat Completions is implemented; `/v1/responses` and `/v1/messages` are not.
+- Anthropic `/v1/messages` is not implemented.
 
 ## Troubleshooting
 
@@ -219,11 +219,18 @@ Read [SECURITY.md](SECURITY.md) before deploying or modifying the proxy. In part
 
 ## Development
 
+The implementation is split by responsibility:
+
+- `grokbot2api.py` contains the HTTP router, Chat Completions adapter, and CLI.
+- `responses_api.py` contains Responses request conversion and SSE events.
+- `api_common.py` contains shared content and tool-call ID normalization.
+- `sand_inference.py` contains the credential exchange and Connect helpers.
+
 Run the offline test suite:
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile grokbot2api.py sand_inference.py
+python3 -m py_compile grokbot2api.py responses_api.py api_common.py sand_inference.py
 ```
 
 No live credential is required for tests.
