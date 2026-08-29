@@ -443,13 +443,17 @@ class SandBackend:
 
     def infer_native(
         self,
-        model: str,
+        client_model: str,
         messages: list[Any],
         tools: list[Any],
         request: dict[str, Any],
     ) -> dict[str, Any]:
         with self.lock:
-            self.args.model = model or self.options.model
+            # The local model ID is client-facing metadata. Always route it to
+            # the upstream model selected when the proxy was started. Keeping
+            # those IDs separate also prevents clients from merging a custom
+            # endpoint with built-in model metadata such as its context window.
+            self.args.model = self.options.model
             credential = self.module.load_renewal_credential(self.args)
             meta = self.module.client_meta(self.args)
             token = self.module.get_access_token(self.args, credential, meta)

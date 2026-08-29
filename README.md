@@ -43,12 +43,17 @@ Add the following model entry to `~/.grok/config.toml`:
 ```toml
 [model.cursor-grok-4-6]
 name = "Cursor Grok 4.6 via grokbot2api"
-model = "grok-4.6"
+model = "cursor-grok-4-6"
 base_url = "http://127.0.0.1:8765/v1"
 api_backend = "responses"
 api_key = "local-only"
 context_window = 256000
 ```
+
+Keep the custom `model` value distinct from the built-in `grok-4.6` ID.
+Otherwise Grok Build can merge the custom endpoint with cached built-in model
+metadata and display the built-in 500K context window. The proxy maps the
+client-facing `cursor-grok-4-6` ID to its `--model grok-4.6` upstream model.
 
 To make it the default model, also add:
 

@@ -1,7 +1,10 @@
 import json
 import sys
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +15,28 @@ import sand_inference as upstream  # noqa: E402
 
 
 class NativeProtocolTests(unittest.TestCase):
+    def test_client_model_alias_routes_to_configured_upstream_model(self):
+        backend = bridge.SandBackend.__new__(bridge.SandBackend)
+        backend.options = SimpleNamespace(model="grok-4.6")
+        backend.args = SimpleNamespace(model="")
+        backend.lock = threading.Lock()
+        backend.module = SimpleNamespace(
+            load_renewal_credential=lambda args: "credential",
+            client_meta=lambda args: {},
+            get_access_token=lambda args, credential, meta, force=False: {
+                "accessToken": "token"
+            },
+        )
+
+        def fake_native_stream(module, args, token, messages, tools, request):
+            return {"ok": True, "model": args.model}
+
+        with mock.patch.object(bridge, "native_stream_llm", side_effect=fake_native_stream):
+            result = backend.infer_native("cursor-grok-4-6", [], [], {})
+
+        self.assertEqual(result["model"], "grok-4.6")
+        self.assertEqual(backend.args.model, "grok-4.6")
+
     def test_request_contains_messages_tools_and_requested_model(self):
         messages = [
             {"role": "system", "content": "You are an agent."},

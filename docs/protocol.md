@@ -377,6 +377,11 @@ The local server accepts both `POST /v1/responses` and
 protobuf request; the difference is limited to the local request and response
 representation.
 
+The request's model ID is preserved in the local response, while inference is
+routed to the upstream model selected with the proxy's `--model` option. This
+allows a client to use a distinct custom model ID without inheriting metadata
+from a built-in model with the same ID.
+
 For the Responses API, message items, `function_call` items, and
 `function_call_output` items are converted into native core messages. Function
 tools use the Responses top-level `name`, `description`, and `parameters`

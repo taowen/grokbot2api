@@ -3,7 +3,7 @@ default = "cursor-grok-4-6"
 
 [model.cursor-grok-4-6]
 name = "Cursor Grok 4.6 via grokbot2api"
-model = "grok-4.6"
+model = "cursor-grok-4-6"
 base_url = "http://127.0.0.1:8765/v1"
 api_backend = "responses"
 api_key = "local-only"
