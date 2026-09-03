@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -15,6 +16,25 @@ import sand_inference as upstream  # noqa: E402
 
 
 class NativeProtocolTests(unittest.TestCase):
+    def test_machine_id_environment_override_is_stable(self):
+        with mock.patch.dict(upstream.os.environ, {"SAND_MACHINE_ID": "machine-1"}):
+            self.assertEqual(upstream.load_machine_id(), "machine-1")
+            self.assertEqual(upstream.load_machine_id(), "machine-1")
+
+    def test_write_cache_on_current_platform(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "nested" / "token.json"
+            upstream.write_cache(cache, "access-token", 123456, "conversation-1")
+
+            self.assertEqual(
+                json.loads(cache.read_text()),
+                {
+                    "accessToken": "access-token",
+                    "expiresAtMs": 123456,
+                    "conversationId": "conversation-1",
+                },
+            )
+
     def test_client_model_alias_routes_to_configured_upstream_model(self):
         backend = bridge.SandBackend.__new__(bridge.SandBackend)
         backend.options = SimpleNamespace(model="grok-4.6")

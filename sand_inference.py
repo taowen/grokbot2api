@@ -215,10 +215,29 @@ def cursor_checksum(machine_id: str) -> str:
 
 
 def load_machine_id() -> str:
-    p = Path("/etc/machine-id")
-    if p.is_file():
-        return p.read_text().strip()
-    return uuid.uuid4().hex
+    override = (os.environ.get("SAND_MACHINE_ID") or "").strip()
+    if override:
+        return override
+
+    candidates = [Path("/etc/machine-id")]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        # Reuse Cursor's own persisted device identity on Windows.  Generating
+        # a UUID per request makes the upstream see every call as a new
+        # computer and quickly triggers its device-count abuse protection.
+        candidates.append(Path(appdata) / "Cursor" / "machineid")
+    for path in candidates:
+        try:
+            machine_id = path.read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if machine_id:
+            return machine_id
+
+    # Last-resort deterministic identity for platforms without either file.
+    # This is intentionally stable across requests and process restarts.
+    node = uuid.getnode()
+    return uuid.uuid5(uuid.NAMESPACE_OID, f"{node:012x}").hex
 
 
 def client_meta(args) -> dict[str, str]:
@@ -282,7 +301,11 @@ def write_cache(path: Path, access_token: str, expires_at_ms: int, conversation_
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        # ``fchmod`` is unavailable on Windows.  The mode passed to os.open
+        # already restricts the file on POSIX; repeat it there to correct an
+        # existing cache file whose permissions may be broader.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as cache_file:
             fd = -1
             cache_file.write(json.dumps(payload))
