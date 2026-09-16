@@ -215,7 +215,9 @@ def cursor_checksum(machine_id: str) -> str:
 
 
 def load_machine_id() -> str:
-    override = (os.environ.get("SAND_MACHINE_ID") or "").strip()
+    # GROKBOT_MACHINE_ID is the name the packaged Grok Bot clients and companion providers use
+    # for the same value; accept it as an alias so both wiring styles work.
+    override = (os.environ.get("SAND_MACHINE_ID") or os.environ.get("GROKBOT_MACHINE_ID") or "").strip()
     if override:
         return override
 
@@ -349,13 +351,37 @@ def renew(credential: str, backend_url: str, meta: dict[str, str]) -> dict:
             parsed = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise SystemExit(f"renewal failed HTTP {e.code}: {e.read().decode('utf-8','replace')[:500]}") from e
-    token = parsed.get("accessToken") if isinstance(parsed, dict) else None
+    # Observed (2026-09-15) on a Grok Bot account: the exchange returns two tokens —
+    # accessToken (type "session") and grokBotToken (type "grok_bot") — and only grokBotToken
+    # authenticates aiserver.v1.InferenceService/Stream; sending accessToken yields
+    # ERROR_NOT_LOGGED_IN. Prefer grokBotToken when the response carries it and keep the
+    # previous behaviour otherwise, so deployments whose exchange returns a single usable
+    # accessToken keep working. Assumption not verified here: whether other credential classes
+    # ever return only an accessToken that is itself valid for inference.
+    token = None
+    if isinstance(parsed, dict):
+        for field in ("grokBotToken", "grok_bot_token", "accessToken"):
+            candidate = parsed.get(field)
+            if isinstance(candidate, str) and candidate:
+                token = candidate
+                break
     if not isinstance(token, str) or not token:
-        raise SystemExit("renewal returned no accessToken")
+        raise SystemExit("renewal returned no grokBotToken/accessToken")
+    if isinstance(parsed, dict) and not parsed.get("grokBotToken") and not parsed.get("grok_bot_token"):
+        # Back-compatibility path: keep working for exchanges that only return the session token,
+        # but say so — sending that token to the inference stream fails with ERROR_NOT_LOGGED_IN,
+        # and a silent fallback turns a renamed or absent field into an unexplained outage.
+        print("warning: renewal returned no grokBotToken; using accessToken", file=sys.stderr)
     exp = parsed.get("expiresAtMs")
     if not isinstance(exp, (int, float)):
         exp = jwt_exp_ms(token) or (now_ms() + DEFAULT_TTL_MS)
-    return {"accessToken": token, "expiresAtMs": int(exp), "renewed": True}
+    session_token = parsed.get("accessToken") if isinstance(parsed, dict) else None
+    return {
+        "accessToken": token,
+        "expiresAtMs": int(exp),
+        "renewed": True,
+        "sessionToken": session_token if isinstance(session_token, str) and session_token else None,
+    }
 
 
 def get_access_token(args, credential: str, meta: dict[str, str], force: bool = False) -> dict:
