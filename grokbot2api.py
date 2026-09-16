@@ -533,6 +533,11 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
         if path in {"", "/health"}:
             self.send_json(200, {"ok": True})
             return
+        # Every other route describes the account (model catalogue, allowance), so it carries the
+        # same Bearer token as inference. Only the health probe stays open.
+        if not self.authorized():
+            self.send_json(401, {"error": {"message": "invalid API key", "type": "authentication_error"}})
+            return
         if path in {"/v1/models", "/models"}:
             model = self.server.backend.options.model
             self.send_json(
