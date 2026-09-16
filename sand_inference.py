@@ -215,7 +215,9 @@ def cursor_checksum(machine_id: str) -> str:
 
 
 def load_machine_id() -> str:
-    override = (os.environ.get("SAND_MACHINE_ID") or "").strip()
+    # GROKBOT_MACHINE_ID is the name the packaged Grok Bot clients and companion providers use
+    # for the same value; accept it as an alias so both wiring styles work.
+    override = (os.environ.get("SAND_MACHINE_ID") or os.environ.get("GROKBOT_MACHINE_ID") or "").strip()
     if override:
         return override
 
@@ -349,13 +351,101 @@ def renew(credential: str, backend_url: str, meta: dict[str, str]) -> dict:
             parsed = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise SystemExit(f"renewal failed HTTP {e.code}: {e.read().decode('utf-8','replace')[:500]}") from e
-    token = parsed.get("accessToken") if isinstance(parsed, dict) else None
+    # Observed (2026-09-15) on a Grok Bot account: the exchange returns two tokens —
+    # accessToken (type "session") and grokBotToken (type "grok_bot") — and only grokBotToken
+    # authenticates aiserver.v1.InferenceService/Stream; sending accessToken yields
+    # ERROR_NOT_LOGGED_IN. Prefer grokBotToken when the response carries it and keep the
+    # previous behaviour otherwise, so deployments whose exchange returns a single usable
+    # accessToken keep working. Assumption not verified here: whether other credential classes
+    # ever return only an accessToken that is itself valid for inference.
+    token = None
+    if isinstance(parsed, dict):
+        for field in ("grokBotToken", "grok_bot_token", "accessToken"):
+            candidate = parsed.get(field)
+            if isinstance(candidate, str) and candidate:
+                token = candidate
+                break
     if not isinstance(token, str) or not token:
-        raise SystemExit("renewal returned no accessToken")
+        raise SystemExit("renewal returned no grokBotToken/accessToken")
+    if isinstance(parsed, dict) and not parsed.get("grokBotToken") and not parsed.get("grok_bot_token"):
+        # Back-compatibility path: keep working for exchanges that only return the session token,
+        # but say so — sending that token to the inference stream fails with ERROR_NOT_LOGGED_IN,
+        # and a silent fallback turns a renamed or absent field into an unexplained outage.
+        print("warning: renewal returned no grokBotToken; using accessToken", file=sys.stderr)
     exp = parsed.get("expiresAtMs")
     if not isinstance(exp, (int, float)):
         exp = jwt_exp_ms(token) or (now_ms() + DEFAULT_TTL_MS)
-    return {"accessToken": token, "expiresAtMs": int(exp), "renewed": True}
+    session_token = parsed.get("accessToken") if isinstance(parsed, dict) else None
+    return {
+        "accessToken": token,
+        "expiresAtMs": int(exp),
+        "renewed": True,
+        "sessionToken": session_token if isinstance(session_token, str) and session_token else None,
+    }
+
+
+# Sand weekly allowance. Lives on the Dashboard service, takes an empty request message, and -
+# unlike inference - authenticates with the session token (accessToken) instead of grokBotToken:
+# observed 2026-09-15, accessToken -> 200 and grokBotToken -> 401 ERROR_NOT_LOGGED_IN.
+SAND_USAGE_PATH = "/aiserver.v1.DashboardService/GetSandUsageStatus"
+
+
+def fetch_sand_usage(
+    credential: str,
+    backend_url: str,
+    meta: dict[str, str],
+    machine_id: str,
+    timeout_ms: int = 30000,
+) -> dict:
+    """Mint a session token and read the sand allowance status.
+
+    Returns the upstream fields (usagePercent is the USED share, not the remaining one) plus
+    usageRemainingPercent, or {"error": "..."} so callers can surface a soft failure.
+    """
+    try:
+        minted = renew(credential, backend_url, meta)
+    except SystemExit as error:
+        return {"error": str(error)}
+    session = minted.get("sessionToken")
+    if not isinstance(session, str) or not session:
+        return {"error": "renewal returned no session token for the usage lookup"}
+    headers = {
+        "authorization": f"Bearer {session}",
+        "content-type": "application/json",
+        "connect-protocol-version": "1",
+        "connect-timeout-ms": str(timeout_ms),
+        "x-cursor-checksum": cursor_checksum(machine_id),
+        **meta,
+    }
+    request = urllib.request.Request(
+        backend_url.rstrip("/") + SAND_USAGE_PATH, data=b"{}", method="POST", headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_ms / 1000) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return {"error": f"usage lookup HTTP {error.code}: {error.read().decode('utf-8', 'replace')[:300]}"}
+    except Exception as error:  # noqa: BLE001
+        return {"error": f"usage lookup {type(error).__name__}: {error}"}
+    if not isinstance(payload, dict):
+        return {"error": "usage lookup returned a non-object payload"}
+    used = payload.get("usagePercent")
+    result = {
+        "usagePercent": used,
+        "usageRemainingPercent": round(100 - float(used), 3) if isinstance(used, (int, float)) else None,
+        "currentPeriodStart": payload.get("currentPeriodStart"),
+        "nextResetTimestampUtc": payload.get("nextResetTimestampUtc"),
+        "hasAvailableUsage": payload.get("hasAvailableUsage"),
+        "hasNonZeroIncludedLimit": payload.get("hasNonZeroIncludedLimit"),
+        "availableBankedResetCount": payload.get("availableBankedResetCount"),
+        "usesPooledEnterpriseAllowance": payload.get("usesPooledEnterpriseAllowance"),
+        "grokPlanLabel": payload.get("grokPlanLabel"),
+        "cursorPlanName": payload.get("cursorPlanName"),
+    }
+    on_demand = payload.get("onDemandSettings")
+    if isinstance(on_demand, dict):
+        result["onDemandDashboardUrl"] = on_demand.get("dashboardUrl")
+    return result
 
 
 def get_access_token(args, credential: str, meta: dict[str, str], force: bool = False) -> dict:

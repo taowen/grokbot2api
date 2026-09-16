@@ -37,6 +37,12 @@ DEFAULT_CACHE = Path("/tmp/grokbot2api-token.json")
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 STREAM_HEARTBEAT_SECONDS = 1.0
 
+# Observed (2026-09-15): requested output ceilings below ~160 are rejected upstream with
+# "Provider exceeded max output tokens." — 8/32/64/100/128 all fail, 160 and above are
+# accepted. Clients that ask for small budgets (titles, one-line answers) therefore get a
+# confusing 502. max_tokens is a ceiling, not a target, so raise small ones instead.
+DEFAULT_MIN_MAX_TOKENS = 512
+
 
 def load_upstream(path: Path) -> ModuleType:
     if not path.is_file():
@@ -220,6 +226,25 @@ def encode_native_request(
     if model_config:
         body += upstream.pb_msg(4, model_config)
     return body
+
+
+def clamp_output_ceiling(request: dict[str, Any], min_max_tokens: int) -> dict[str, Any]:
+    """Raise a requested output ceiling to the smallest value the upstream lane accepts.
+
+    Returns the input unchanged when there is nothing to raise. The input mapping is never
+    mutated: a clamped copy is returned instead.
+    """
+    requested = request.get("max_tokens")
+    if (
+        not isinstance(min_max_tokens, int)
+        or min_max_tokens <= 0
+        or not isinstance(requested, int)
+        or requested >= min_max_tokens
+    ):
+        return request
+    clamped = dict(request)
+    clamped["max_tokens"] = min_max_tokens
+    return clamped
 
 
 def first_text(fields: dict[int, list[Any]], field: int) -> str:
@@ -441,6 +466,14 @@ class SandBackend:
                 f"set {self.module.CREDENTIAL_ENV} to a valid credential before starting the proxy"
             )
 
+    def sand_usage(self) -> dict[str, Any]:
+        """Read the account's sand allowance status (percent used, reset time)."""
+        credential = self.module.load_renewal_credential(self.args)
+        meta = self.module.client_meta(self.args)
+        return self.module.fetch_sand_usage(
+            credential, self.args.backend_url, meta, self.module.load_machine_id()
+        )
+
     def infer_native(
         self,
         client_model: str,
@@ -457,10 +490,17 @@ class SandBackend:
             credential = self.module.load_renewal_credential(self.args)
             meta = self.module.client_meta(self.args)
             token = self.module.get_access_token(self.args, credential, meta)
-            result = native_stream_llm(self.module, self.args, token["accessToken"], messages, tools, request)
+            # getattr: callers may build an options namespace without the newer flag (the
+            # project's own tests do), and the documented default is the safe behaviour.
+            payload = clamp_output_ceiling(
+                request, getattr(self.options, "min_max_tokens", DEFAULT_MIN_MAX_TOKENS)
+            )
+            result = native_stream_llm(self.module, self.args, token["accessToken"], messages, tools, payload)
             if result.get("httpStatus") == 401:
                 token = self.module.get_access_token(self.args, credential, meta, force=True)
-                result = native_stream_llm(self.module, self.args, token["accessToken"], messages, tools, request)
+                result = native_stream_llm(
+                    self.module, self.args, token["accessToken"], messages, tools, payload
+                )
             return result
 
     def complete(
@@ -532,6 +572,15 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path in {"", "/health"}:
             self.send_json(200, {"ok": True})
+            return
+        # Every other route describes the account (model catalogue, allowance), so it carries the
+        # same Bearer token as inference. Only the health probe stays open.
+        if not self.authorized():
+            self.send_json(401, {"error": {"message": "invalid API key", "type": "authentication_error"}})
+            return
+        if path in {"/usage", "/v1/usage"}:
+            # Weekly sand allowance, the same figure the desktop client shows as "Weekly usage".
+            self.send_json(200, self.server.backend.sand_usage())
             return
         if path in {"/v1/models", "/models"}:
             model = self.server.backend.options.model
@@ -782,6 +831,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--namespace", default="prod")
     parser.add_argument("--team-id", default="")
     parser.add_argument("--timeout-ms", type=int, default=600000)
+    parser.add_argument(
+        "--min-max-tokens",
+        type=int,
+        default=DEFAULT_MIN_MAX_TOKENS,
+        help=(
+            "smallest output ceiling to send upstream; lower client values are raised to it "
+            "(0 disables the floor)"
+        ),
+    )
     parser.add_argument(
         "--api-key-env",
         default="GROK_BUILD_PROXY_API_KEY",

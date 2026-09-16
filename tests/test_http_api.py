@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -210,6 +211,45 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(response["output"][0]["type"], "function_call")
         self.assertEqual(response["output"][0]["name"], "run_terminal_command")
         self.assertEqual(response["usage"]["input_tokens_details"]["cached_tokens"], 8)
+
+
+class ApiKeyTests(unittest.TestCase):
+    """A configured --api-key-env must guard every route except the health probe."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = bridge.ProxyServer(("127.0.0.1", 0), FakeBackend(), "secret-key")
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def get(self, path, key=None):
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        request = urllib.request.Request(self.base_url + path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    def test_health_stays_open(self):
+        status, _ = self.get("/health")
+        self.assertEqual(status, 200)
+
+    def test_models_requires_the_api_key(self):
+        status, _ = self.get("/v1/models")
+        self.assertEqual(status, 401)
+
+    def test_models_accepts_the_api_key(self):
+        status, body = self.get("/v1/models", "secret-key")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["data"][0]["id"], "grok-4.6")
 
 
 if __name__ == "__main__":

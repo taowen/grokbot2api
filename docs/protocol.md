@@ -415,6 +415,48 @@ The helper currently buffers the complete upstream Connect response. To prevent 
 
 Client disconnects are treated as cancellations and do not trigger a second HTTP error response.
 
+## Sand credential exchange
+
+`POST /sand-box/inference-credential` with `{"credential": "<renewal credential>"}` returns two
+tokens (observed 2026-09-15 on a Grok Bot account):
+
+- `accessToken` — `type: "session"`. Authenticates the Dashboard endpoints (`AiService/AvailableModels`,
+  `DashboardService/GetSandUsageStatus`).
+- `grokBotToken` — `type: "grok_bot"`. Authenticates `aiserver.v1.InferenceService/Stream`.
+
+Sending the session token to the inference stream returns `ERROR_NOT_LOGGED_IN`, and sending the
+grok_bot token to a Dashboard endpoint returns `unauthenticated`. The bridge therefore prefers
+`grokBotToken` for inference and uses the session token for catalogue and allowance calls. When an
+exchange returns no `grokBotToken`, the session token is still used for back-compatibility, with a
+warning on stderr.
+
+Requests also carry `x-cursor-checksum`, derived from the machine identity that was used when the
+renewal credential was issued (`SAND_MACHINE_ID`, or `GROKBOT_MACHINE_ID` in packaged clients).
+A mismatched machine identity fails the same way a bad token does, so credentials are effectively
+bound to the machine that minted them.
+
+## Sand allowance (weekly usage)
+
+`POST /aiserver.v1.DashboardService/GetSandUsageStatus` (Connect JSON unary, empty request body,
+session token) is what the desktop client renders as "Weekly usage". Reconstructed response fields:
+
+- `usagePercent` — share of the weekly allowance already used (numeric, observed `12.012356`)
+- `currentPeriodStart`, `nextResetTimestampUtc` — ISO-8601 strings bounding the period
+- `hasAvailableUsage`, `hasNonZeroIncludedLimit` — booleans
+- `availableBankedResetCount`, `usesPooledEnterpriseAllowance` — optional, absent on the observed account
+- `grokPlanLabel`, `cursorPlanName` — plan labels, e.g. `Grok Bot Plan` / `Ultra`
+- `onDemandSettings.dashboardUrl` — billing dashboard URL that embeds the account identifier
+
+The local bridge exposes this at `GET /usage` (and `/v1/usage`), adding a derived
+`usageRemainingPercent`. It is a read-only metering call and does not consume allowance.
+
+## Output ceiling floor
+
+Requested output ceilings below roughly 160 tokens are rejected upstream with
+"Provider exceeded max output tokens." (8, 32, 64, 100 and 128 observed failing; 160 accepted).
+Because `max_tokens` is a ceiling rather than a target, the bridge raises smaller values to
+`--min-max-tokens` (default 512) instead of forwarding a request that is certain to fail.
+
 ## Versioning expectations
 
 There is no compatibility guarantee for this private contract. A runtime update may change:
