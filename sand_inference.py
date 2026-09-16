@@ -384,6 +384,70 @@ def renew(credential: str, backend_url: str, meta: dict[str, str]) -> dict:
     }
 
 
+# Sand weekly allowance. Lives on the Dashboard service, takes an empty request message, and -
+# unlike inference - authenticates with the session token (accessToken) instead of grokBotToken:
+# observed 2026-09-15, accessToken -> 200 and grokBotToken -> 401 ERROR_NOT_LOGGED_IN.
+SAND_USAGE_PATH = "/aiserver.v1.DashboardService/GetSandUsageStatus"
+
+
+def fetch_sand_usage(
+    credential: str,
+    backend_url: str,
+    meta: dict[str, str],
+    machine_id: str,
+    timeout_ms: int = 30000,
+) -> dict:
+    """Mint a session token and read the sand allowance status.
+
+    Returns the upstream fields (usagePercent is the USED share, not the remaining one) plus
+    usageRemainingPercent, or {"error": "..."} so callers can surface a soft failure.
+    """
+    try:
+        minted = renew(credential, backend_url, meta)
+    except SystemExit as error:
+        return {"error": str(error)}
+    session = minted.get("sessionToken")
+    if not isinstance(session, str) or not session:
+        return {"error": "renewal returned no session token for the usage lookup"}
+    headers = {
+        "authorization": f"Bearer {session}",
+        "content-type": "application/json",
+        "connect-protocol-version": "1",
+        "connect-timeout-ms": str(timeout_ms),
+        "x-cursor-checksum": cursor_checksum(machine_id),
+        **meta,
+    }
+    request = urllib.request.Request(
+        backend_url.rstrip("/") + SAND_USAGE_PATH, data=b"{}", method="POST", headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_ms / 1000) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return {"error": f"usage lookup HTTP {error.code}: {error.read().decode('utf-8', 'replace')[:300]}"}
+    except Exception as error:  # noqa: BLE001
+        return {"error": f"usage lookup {type(error).__name__}: {error}"}
+    if not isinstance(payload, dict):
+        return {"error": "usage lookup returned a non-object payload"}
+    used = payload.get("usagePercent")
+    result = {
+        "usagePercent": used,
+        "usageRemainingPercent": round(100 - float(used), 3) if isinstance(used, (int, float)) else None,
+        "currentPeriodStart": payload.get("currentPeriodStart"),
+        "nextResetTimestampUtc": payload.get("nextResetTimestampUtc"),
+        "hasAvailableUsage": payload.get("hasAvailableUsage"),
+        "hasNonZeroIncludedLimit": payload.get("hasNonZeroIncludedLimit"),
+        "availableBankedResetCount": payload.get("availableBankedResetCount"),
+        "usesPooledEnterpriseAllowance": payload.get("usesPooledEnterpriseAllowance"),
+        "grokPlanLabel": payload.get("grokPlanLabel"),
+        "cursorPlanName": payload.get("cursorPlanName"),
+    }
+    on_demand = payload.get("onDemandSettings")
+    if isinstance(on_demand, dict):
+        result["onDemandDashboardUrl"] = on_demand.get("dashboardUrl")
+    return result
+
+
 def get_access_token(args, credential: str, meta: dict[str, str], force: bool = False) -> dict:
     cached = None if force else read_cache(args.cache)
     if cached and cache_valid(cached):

@@ -466,6 +466,14 @@ class SandBackend:
                 f"set {self.module.CREDENTIAL_ENV} to a valid credential before starting the proxy"
             )
 
+    def sand_usage(self) -> dict[str, Any]:
+        """Read the account's sand allowance status (percent used, reset time)."""
+        credential = self.module.load_renewal_credential(self.args)
+        meta = self.module.client_meta(self.args)
+        return self.module.fetch_sand_usage(
+            credential, self.args.backend_url, meta, self.module.load_machine_id()
+        )
+
     def infer_native(
         self,
         client_model: str,
@@ -569,6 +577,10 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
         # same Bearer token as inference. Only the health probe stays open.
         if not self.authorized():
             self.send_json(401, {"error": {"message": "invalid API key", "type": "authentication_error"}})
+            return
+        if path in {"/usage", "/v1/usage"}:
+            # Weekly sand allowance, the same figure the desktop client shows as "Weekly usage".
+            self.send_json(200, self.server.backend.sand_usage())
             return
         if path in {"/v1/models", "/models"}:
             model = self.server.backend.options.model
