@@ -26,6 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from collections.abc import Callable
 from typing import Any
 
 from api_common import ClientDisconnected, content_text, normalize_tool_call_id
@@ -42,6 +43,17 @@ STREAM_HEARTBEAT_SECONDS = 1.0
 # accepted. Clients that ask for small budgets (titles, one-line answers) therefore get a
 # confusing 502. max_tokens is a ceiling, not a target, so raise small ones instead.
 DEFAULT_MIN_MAX_TOKENS = 512
+
+# Sand model space, measured against the live lane (2026-09-15). The sand router accepts family
+# slugs, and the Grok Bot entitlement covers exactly these: within AvailableModels' 38-row
+# catalog everything else (claude-opus-5, gpt-5.6-*, gemini-3.8-flash, muse-spark-1.3, kimi-k3,
+# glm-5.2, …) answers `permission_denied` on InferenceService/Stream for this credential.
+#   grok-4.6 -> cursor-grok-4.6-high-fast · grok-4.5 -> cursor-grok-4.5-high-fast
+#   composer-2.5 -> composer-2.5-fast · default -> cursor-grok-4.5-high-fast
+# The three sand routers are Grok Bot routing ids, not models (cua = computer/browser use,
+# automation = routine/trigger fires, default = the ordinary Bot path) and resolve server-side:
+# sand-cua currently lands on gpt-5.6-luna-high, sand-automation on cursor-grok-4.5-high.
+SAND_MODEL_SLUGS = ("grok-4.6", "grok-4.5", "composer-2.5", "default", "sand-default", "sand-cua", "sand-automation")
 
 
 def load_upstream(path: Path) -> ModuleType:
@@ -214,8 +226,11 @@ def encode_native_request(
         body += upstream.pb_str(12, conversation_id)
 
     model_config = b""
-    if isinstance(request.get("max_tokens"), int):
-        model_config += upstream.pb_var(1, request["max_tokens"])
+    # Intentionally do not forward max_tokens. Measured 2026-09-16 (Probe C in
+    # docs/superpowers/specs/2026-09-16-grokbot-bridge-concurrency.md): a
+    # 200-word answer fails at both 512 and 4096 because effort=high reasoning
+    # spends the same budget; omitting the field succeeds. Raising the floor
+    # would redesign token accounting and is explicitly out of scope.
     if isinstance(request.get("temperature"), (int, float)):
         model_config += upstream._key(2, 5) + struct.pack("<f", float(request["temperature"]))
     if isinstance(request.get("top_p"), (int, float)):
@@ -270,60 +285,63 @@ def decode_extended_usage(upstream: ModuleType, raw: bytes) -> dict[str, int]:
     }
 
 
-def decode_native_response(upstream: ModuleType, raw: bytes, status: int, request_id: str, model: str) -> dict[str, Any]:
-    if status != 200:
-        return {
-            "ok": False,
-            "httpStatus": status,
-            "error": raw[:800].decode("utf-8", "replace"),
-            "requestId": request_id,
-            "modelId": model,
-        }
+class NativeStreamDecoder:
+    """Decode native inference envelopes one at a time without losing aggregate state."""
 
-    texts: list[str] = []
-    thinking: list[str] = []
-    errors: list[str] = []
-    response_model = model
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    extended_usage: dict[str, int] = {}
-    pending: dict[str, dict[str, Any]] = {}
-    completed_calls: list[dict[str, Any]] = []
-    envelopes = upstream.iter_envelopes_from_bytes(raw)
+    def __init__(self, upstream: ModuleType, model: str) -> None:
+        self.upstream = upstream
+        self.model = model
+        self.texts: list[str] = []
+        self.thinking: list[str] = []
+        self.errors: list[str] = []
+        self.response_model = model
+        self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.extended_usage: dict[str, int] = {}
+        self.pending: dict[str, dict[str, Any]] = {}
+        self.completed_calls: list[dict[str, Any]] = []
+        self.envelopes = 0
 
-    for flags, payload in envelopes:
+    def feed(self, flags: int, payload: bytes) -> list[dict[str, Any]]:
+        self.envelopes += 1
+        events: list[dict[str, Any]] = []
         if flags & 2:
             try:
                 trailer = json.loads(payload.decode("utf-8") or "{}")
                 if isinstance(trailer, dict) and trailer.get("error"):
-                    errors.append(str(trailer["error"]))
+                    message = str(trailer["error"])
+                    self.errors.append(message)
+                    events.append({"type": "error", "message": message})
             except Exception:
                 pass
-            continue
+            return events
         if flags & 1:
             payload = gzip.decompress(payload)
-        outer, _ = upstream.pb_decode(payload)
+        outer, _ = self.upstream.pb_decode(payload)
 
         for part_raw in outer.get(1, []):
-            part, _ = upstream.pb_decode(part_raw)
+            part, _ = self.upstream.pb_decode(part_raw)
             text = first_text(part, 1)
             if text:
-                texts.append(text)
+                self.texts.append(text)
+                events.append({"type": "text", "text": text})
 
         for part_raw in outer.get(9, []):
-            part, _ = upstream.pb_decode(part_raw)
+            part, _ = self.upstream.pb_decode(part_raw)
             text = first_text(part, 1)
             if text:
-                thinking.append(text)
+                self.thinking.append(text)
 
         for part_raw in outer.get(2, []):
-            part, _ = upstream.pb_decode(part_raw)
+            part, _ = self.upstream.pb_decode(part_raw)
             call_id = normalize_tool_call_id(first_text(part, 1))
             name = first_text(part, 2)
             args_delta = first_text(part, 3)
             is_complete = bool(first_int(part, 4))
             index = first_int(part, 5, -1)
-            key = call_id or (f"index:{index}" if index >= 0 else f"pending:{len(pending)}")
-            state = pending.setdefault(key, {"id": call_id, "name": name, "args": "", "index": index})
+            key = call_id or (f"index:{index}" if index >= 0 else f"pending:{len(self.pending)}")
+            state = self.pending.setdefault(
+                key, {"id": call_id, "name": name, "args": "", "index": index}
+            )
             if call_id:
                 state["id"] = call_id
             if name:
@@ -334,63 +352,92 @@ def decode_native_response(upstream: ModuleType, raw: bytes, status: int, reques
                 else:
                     state["args"] += args_delta
             if is_complete:
-                completed_calls.append(
-                    {
-                        "id": state["id"] or f"call_{uuid.uuid4().hex[:24]}",
-                        "type": "function",
-                        "function": {"name": state["name"], "arguments": state["args"] or "{}"},
-                    }
-                )
-                pending.pop(key, None)
+                call = {
+                    "id": state["id"] or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": state["name"],
+                        "arguments": state["args"] or "{}",
+                    },
+                }
+                self.completed_calls.append(call)
+                self.pending.pop(key, None)
+                events.append({"type": "tool_call", "call": call})
 
         for usage_raw in outer.get(3, []):
-            info, _ = upstream.pb_decode(usage_raw)
+            info, _ = self.upstream.pb_decode(usage_raw)
             prompt_tokens = first_int(info, 1)
             completion_tokens = first_int(info, 2)
-            usage = {
+            self.usage = {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": first_int(info, 3, prompt_tokens + completion_tokens),
             }
 
         for usage_raw in outer.get(5, []):
-            extended_usage = decode_extended_usage(upstream, usage_raw)
+            self.extended_usage = decode_extended_usage(self.upstream, usage_raw)
 
         for info_raw in outer.get(4, []):
-            info, _ = upstream.pb_decode(info_raw)
-            response_model = first_text(info, 2) or response_model
+            info, _ = self.upstream.pb_decode(info_raw)
+            self.response_model = first_text(info, 2) or self.response_model
             error = first_text(info, 5)
             if error:
-                errors.append(error)
+                self.errors.append(error)
+                events.append({"type": "error", "message": error})
 
         for error_raw in outer.get(8, []):
-            error, _ = upstream.pb_decode(error_raw)
-            errors.append(first_text(error, 1) or repr(error))
+            error, _ = self.upstream.pb_decode(error_raw)
+            message = first_text(error, 1) or repr(error)
+            self.errors.append(message)
+            events.append({"type": "error", "message": message})
+        return events
 
-    if extended_usage:
-        prompt_tokens = usage["prompt_tokens"] or extended_usage["prompt_tokens"]
-        completion_tokens = usage["completion_tokens"] or extended_usage["completion_tokens"]
-        usage = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": usage["total_tokens"] or prompt_tokens + completion_tokens,
-            "prompt_tokens_details": {"cached_tokens": extended_usage["cached_prompt_tokens"]},
+    def result(self, status: int, request_id: str) -> dict[str, Any]:
+        usage = self.usage
+        if self.extended_usage:
+            prompt_tokens = usage["prompt_tokens"] or self.extended_usage["prompt_tokens"]
+            completion_tokens = (
+                usage["completion_tokens"] or self.extended_usage["completion_tokens"]
+            )
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": usage["total_tokens"] or prompt_tokens + completion_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": self.extended_usage["cached_prompt_tokens"]
+                },
+            }
+        return {
+            "ok": not self.errors,
+            "httpStatus": status,
+            "requestId": request_id,
+            "model": self.response_model,
+            "modelId": self.model,
+            "text": "".join(self.texts),
+            "thinking": "".join(self.thinking),
+            "tool_calls": self.completed_calls,
+            "error": self.errors[0] if self.errors else None,
+            "envelopes": self.envelopes,
+            "usage": usage,
+            "extended_usage": self.extended_usage,
         }
 
-    return {
-        "ok": not errors,
-        "httpStatus": status,
-        "requestId": request_id,
-        "model": response_model,
-        "modelId": model,
-        "text": "".join(texts),
-        "thinking": "".join(thinking),
-        "tool_calls": completed_calls,
-        "error": errors[0] if errors else None,
-        "envelopes": len(envelopes),
-        "usage": usage,
-        "extended_usage": extended_usage,
-    }
+
+def decode_native_response(
+    upstream: ModuleType, raw: bytes, status: int, request_id: str, model: str
+) -> dict[str, Any]:
+    if status != 200:
+        return {
+            "ok": False,
+            "httpStatus": status,
+            "error": raw[:800].decode("utf-8", "replace"),
+            "requestId": request_id,
+            "modelId": model,
+        }
+    decoder = NativeStreamDecoder(upstream, model)
+    for flags, payload in upstream.iter_envelopes_from_bytes(raw):
+        decoder.feed(flags, payload)
+    return decoder.result(status, request_id)
 
 
 def native_stream_llm(
@@ -400,6 +447,7 @@ def native_stream_llm(
     messages: list[Any],
     tools: list[Any],
     request: dict[str, Any],
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
     invocation_id = str(uuid.uuid4())
@@ -429,17 +477,33 @@ def native_stream_llm(
     headers = upstream.inference_headers(args, access_token, upstream.load_machine_id(), request_id)
     connection.request("POST", upstream.INFERENCE_PATH, body=body, headers=headers)
     response = connection.getresponse()
-    raw = response.read()
     status = response.status
-    connection.close()
-    return decode_native_response(upstream, raw, status, request_id, args.model)
+    try:
+        if status != 200:
+            raw = response.read()
+            return decode_native_response(upstream, raw, status, request_id, args.model)
+        decoder = NativeStreamDecoder(upstream, args.model)
+        for flags, payload in upstream.iter_envelopes_from_fp(response):
+            for event in decoder.feed(flags, payload):
+                if on_event is not None:
+                    on_event(event)
+        return decoder.result(status, request_id)
+    finally:
+        connection.close()
 
 
 class SandBackend:
     def __init__(self, options: argparse.Namespace):
         self.options = options
         self.module = load_upstream(options.upstream_script)
+        # Renewal only. It must NEVER be held across an upstream inference call:
+        # that serialized the whole bridge (measured 2026-09-16 — three
+        # concurrent ~3 s requests took 145 s, and the queue behind it had a
+        # median depth of 9 over 3 h of journal).
         self.lock = threading.Lock()
+        # Bumped on every successful renewal, so a request whose token answered
+        # 401 can tell "nobody has renewed yet" from "somebody already did".
+        self.token_epoch = 0
         self.args = SimpleNamespace(
             backend_url=options.backend_url or self.module.DEFAULT_BACKEND_URL,
             credential=None,
@@ -458,12 +522,17 @@ class SandBackend:
         )
         self.args.conversation_id = self.module.resolve_conversation_id(self.args)
 
+        # Credential resolution: process env first, then omp's resolved secrets file
+        # (~/.omp/agent/secrets/grokbot.env) so the supervisor unit carries no secrets.
         env_credential = os.environ.get(self.module.CREDENTIAL_ENV, "").strip()
+        if not env_credential:
+            env_credential = (self.module.read_secrets_file().get(self.module.CREDENTIAL_ENV) or "").strip()
         if env_credential:
             self.args.credential = env_credential
         else:
             raise RuntimeError(
-                f"set {self.module.CREDENTIAL_ENV} to a valid credential before starting the proxy"
+                f"set {self.module.CREDENTIAL_ENV} (or write {self.module.SECRETS_ENV_FILE}) "
+                "to a valid credential before starting the proxy"
             )
 
     def sand_usage(self) -> dict[str, Any]:
@@ -474,34 +543,70 @@ class SandBackend:
             credential, self.args.backend_url, meta, self.module.load_machine_id()
         )
 
+    def request_args(self) -> SimpleNamespace:
+        """Per-request copy of the upstream argument namespace.
+
+        Concurrent requests must not share it: ``model`` is set per call and
+        ``force_renew`` used to be toggled in place, which is what made the
+        process-wide lock load-bearing. A shallow copy is enough — every field is
+        a str, int, bool or Path.
+        """
+        args = SimpleNamespace(**vars(self.args))
+        # The local model ID is client-facing metadata. Always route it to the
+        # upstream model selected when the proxy was started. Keeping those IDs
+        # separate also prevents clients from merging a custom endpoint with
+        # built-in model metadata such as its context window.
+        args.model = self.options.model
+        return args
+
+    def access_token(
+        self,
+        args: SimpleNamespace,
+        credential: str,
+        meta: dict[str, str],
+        stale_epoch: int | None = None,
+    ) -> tuple[dict[str, Any], int]:
+        """Return (token, epoch). Renewal is serialized; inference is not.
+
+        ``stale_epoch`` names the token generation that just answered 401. If
+        another thread already renewed past it, that renewal is reused, so N
+        concurrent 401s cost one renewal rather than N.
+        """
+        with self.lock:
+            force = stale_epoch is not None and stale_epoch == self.token_epoch
+            token = self.module.get_access_token(args, credential, meta, force=force)
+            if token.get("renewed"):
+                self.token_epoch += 1
+            return token, self.token_epoch
+
     def infer_native(
         self,
         client_model: str,
         messages: list[Any],
         tools: list[Any],
         request: dict[str, Any],
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        with self.lock:
-            # The local model ID is client-facing metadata. Always route it to
-            # the upstream model selected when the proxy was started. Keeping
-            # those IDs separate also prevents clients from merging a custom
-            # endpoint with built-in model metadata such as its context window.
-            self.args.model = self.options.model
-            credential = self.module.load_renewal_credential(self.args)
-            meta = self.module.client_meta(self.args)
-            token = self.module.get_access_token(self.args, credential, meta)
-            # getattr: callers may build an options namespace without the newer flag (the
-            # project's own tests do), and the documented default is the safe behaviour.
-            payload = clamp_output_ceiling(
-                request, getattr(self.options, "min_max_tokens", DEFAULT_MIN_MAX_TOKENS)
+        args = self.request_args()
+        credential = self.module.load_renewal_credential(args)
+        meta = self.module.client_meta(args)
+        token, epoch = self.access_token(args, credential, meta)
+        # getattr: callers may build an options namespace without the newer flag (the
+        # project's own tests do), and the documented default is the safe behaviour.
+        payload = clamp_output_ceiling(
+            request, getattr(self.options, "min_max_tokens", DEFAULT_MIN_MAX_TOKENS)
+        )
+        result = native_stream_llm(
+            self.module, args, token["accessToken"], messages, tools, payload, on_event
+        )
+        if result.get("httpStatus") == 401:
+            # A non-200 upstream response emits no events, so nothing has been
+            # written to the client yet and the retry cannot duplicate content.
+            token, _ = self.access_token(args, credential, meta, stale_epoch=epoch)
+            result = native_stream_llm(
+                self.module, args, token["accessToken"], messages, tools, payload, on_event
             )
-            result = native_stream_llm(self.module, self.args, token["accessToken"], messages, tools, payload)
-            if result.get("httpStatus") == 401:
-                token = self.module.get_access_token(self.args, credential, meta, force=True)
-                result = native_stream_llm(
-                    self.module, self.args, token["accessToken"], messages, tools, payload
-                )
-            return result
+        return result
 
     def complete(
         self,
@@ -509,8 +614,9 @@ class SandBackend:
         messages: list[Any],
         tools: list[Any],
         request: dict[str, Any],
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], str | None, list[dict[str, Any]]]:
-        result = self.infer_native(model, messages, tools, request)
+        result = self.infer_native(model, messages, tools, request, on_event)
         content = str(result.get("text", "")) or None
         calls = result.get("tool_calls") if isinstance(result.get("tool_calls"), list) else []
         return result, content, calls
@@ -583,12 +689,19 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
             self.send_json(200, self.server.backend.sand_usage())
             return
         if path in {"/v1/models", "/models"}:
+            # Sand lanes accept family slugs, not concrete ids: measured 2026-09-15 —
+            # grok-4.6 -> cursor-grok-4.6-high-fast, grok-4.5 -> cursor-grok-4.5-high-fast,
+            # sand-default -> cursor-grok-4.5-high-fast; concrete cursor-* ids and
+            # -high/-xhigh suffixes answer not_found. Keep the configured model first.
             model = self.server.backend.options.model
+            slugs = [model] + [s for s in SAND_MODEL_SLUGS if s != model]
             self.send_json(
                 200,
                 {
                     "object": "list",
-                    "data": [{"id": model, "object": "model", "owned_by": "local-sand-adapter"}],
+                    "data": [
+                        {"id": slug, "object": "model", "owned_by": "cursor-sand"} for slug in slugs
+                    ],
                 },
             )
             return
@@ -745,22 +858,62 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
         self.end_headers()
         self.stream_event(completion_id, created, model, {"role": "assistant"})
 
-        completed: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        updates: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        def publish(event: dict[str, Any]) -> None:
+            updates.put(("event", event))
 
         def invoke_upstream() -> None:
             try:
-                completed.put((True, self.server.backend.complete(model, messages, tools, request)))
+                outcome = self.server.backend.complete(
+                    model, messages, tools, request, on_event=publish
+                )
+                updates.put(("done", (True, outcome)))
             except BaseException as exc:
-                completed.put((False, exc))
+                updates.put(("done", (False, exc)))
 
-        worker = threading.Thread(target=invoke_upstream, daemon=True, name=f"upstream-{completion_id[-8:]}")
+        worker = threading.Thread(
+            target=invoke_upstream,
+            daemon=True,
+            name=f"upstream-{completion_id[-8:]}",
+        )
         worker.start()
+        streamed_text: list[str] = []
+        streamed_call_ids: list[str] = []
         while True:
             try:
-                succeeded, outcome = completed.get(timeout=STREAM_HEARTBEAT_SECONDS)
-                break
+                kind, value = updates.get(timeout=STREAM_HEARTBEAT_SECONDS)
             except queue.Empty:
                 self.stream_heartbeat()
+                continue
+            if kind == "event":
+                event = value
+                if event.get("type") == "text" and isinstance(event.get("text"), str):
+                    text = event["text"]
+                    streamed_text.append(text)
+                    self.stream_event(completion_id, created, model, {"content": text})
+                elif event.get("type") == "tool_call" and isinstance(event.get("call"), dict):
+                    call = event["call"]
+                    call_id = str(call.get("id") or "")
+                    streamed_call_ids.append(call_id)
+                    self.stream_event(
+                        completion_id,
+                        created,
+                        model,
+                        {
+                            "tool_calls": [{
+                                "index": len(streamed_call_ids) - 1,
+                                "id": call_id,
+                                "type": "function",
+                                "function": call["function"],
+                            }]
+                        },
+                    )
+                # An error event changes the aggregate result; emit the existing
+                # one error frame below, once, rather than inventing a new shape.
+                continue
+            succeeded, outcome = value
+            break
 
         if not succeeded:
             self.log_message("upstream exception during stream: %s", outcome)
@@ -784,6 +937,38 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
                 raise ClientDisconnected from exc
             return
 
+        streamed = "".join(streamed_text)
+        if content and content.startswith(streamed):
+            remainder = content[len(streamed):]
+            if remainder:
+                self.stream_event(completion_id, created, model, {"content": remainder})
+        elif content and not streamed:
+            self.stream_event(completion_id, created, model, {"content": content})
+        elif content and content != streamed:
+            self.log_message("streamed content differs from aggregate; refusing duplicate")
+
+        unstreamed_calls = [
+            call for call in calls if str(call.get("id") or "") not in streamed_call_ids
+        ]
+        if unstreamed_calls:
+            offset = len(streamed_call_ids)
+            self.stream_event(
+                completion_id,
+                created,
+                model,
+                {
+                    "tool_calls": [
+                        {
+                            "index": offset + index,
+                            "id": call["id"],
+                            "type": "function",
+                            "function": call["function"],
+                        }
+                        for index, call in enumerate(unstreamed_calls)
+                    ]
+                },
+            )
+
         finish_reason = "tool_calls" if calls else "stop"
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
@@ -797,21 +982,6 @@ class ProxyHandler(ResponsesApiMixin, BaseHTTPRequestHandler):
             details.get("cached_tokens", 0),
             extended.get("context_window", 0),
         )
-
-        if calls:
-            deltas = []
-            for index, call in enumerate(calls):
-                deltas.append(
-                    {
-                        "index": index,
-                        "id": call["id"],
-                        "type": "function",
-                        "function": call["function"],
-                    }
-                )
-            self.stream_event(completion_id, created, model, {"tool_calls": deltas})
-        elif content:
-            self.stream_event(completion_id, created, model, {"content": content})
         self.stream_event(completion_id, created, model, {}, finish_reason)
         self.stream_done()
 
