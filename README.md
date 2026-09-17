@@ -12,7 +12,9 @@ It translates Grok Build requests into Cursor's undocumented `aiserver.v1.Infere
 - OpenAI-compatible `POST /v1/responses` and `POST /v1/chat/completions`
 - Native Cursor protobuf tool calls and tool results
 - Multi-turn Grok Build agent loops
-- Streaming SSE responses with heartbeats
+- Concurrent upstream inference: renewal stays serialized, but in-flight generations do not queue behind each other
+- Incremental Connect-envelope decoding and real SSE token deltas, not a buffered whole response plus heartbeats
+- Optional `GET /usage` for the account's weekly sand allowance
 - `GET /v1/models` and `GET /health`
 - Automatic short-lived access-token renewal
 - Loopback-only binding by default
@@ -164,6 +166,24 @@ Set the same value as `api_key` in the Grok Build model configuration.
 
 The proxy refuses to bind to a non-loopback address unless the selected API-key environment variable is non-empty. Exposing this service to a network is strongly discouraged.
 
+## Performance
+
+Before this change the proxy held one process-wide lock across every Sand call and read the upstream response body whole, so N clients serialized and the first token waited for the last.
+
+Measured on a loopback proxy with the same tiny prompt:
+
+| path | wall |
+|---|---:|
+| single request, old serialized proxy | 87–106 s |
+| 16 concurrent, old serialized proxy | 42 s (batch/single ≈ 10×) |
+| single request, this change | 2.9 s |
+| 16 concurrent, this change | 7.2 s (batch/single ≈ 2.5×) |
+| cross-talk (answer swapped onto the wrong request) | none |
+
+16 in-flight completions now finish together in roughly 7 seconds, and the first content delta is forwarded as soon as its Connect envelopes arrive.
+
+The lock now covers token renewal only, so concurrent requests share one renewal instead of queueing behind a generation. Each request works on its own copy of the upstream arguments, which is what keeps the per-request model selection from leaking between clients.
+
 ## Architecture
 
 ```text
@@ -190,7 +210,7 @@ See [docs/protocol.md](docs/protocol.md) for the wire-format reference.
 
 - The Cursor inference API and protobuf schema are private and undocumented.
 - `grok-4.6` currently rejects a present `InferenceAgentTool.parameters` protobuf field with provider status 422. The proxy omits that field and appends a compact argument signature to each native tool description. Tool calls and results still use native protobuf messages.
-- Upstream responses are buffered by the helper before they are converted to SSE. Heartbeats keep Grok Build's connection alive, but token deltas are not forwarded in real time.
+- `grok-4.6` with `effort=high` still reasons before the first visible word, so the first token can lag even though the proxy no longer waits for the whole response. That delay is upstream, not the proxy lock.
 - Image content in Responses or Chat Completions messages is not currently forwarded.
 - Token usage may be reported as zero when the private endpoint omits usage frames.
 - Anthropic `/v1/messages` is not implemented.
@@ -207,7 +227,7 @@ The upstream provider rejected a tool or model configuration. Confirm that you a
 
 ### `BrokenPipeError`
 
-Older versions waited for the complete upstream response before opening the SSE stream. Current versions send headers immediately and emit heartbeat comments while waiting.
+Older versions waited for the complete upstream response before opening the SSE stream. Current versions open the stream immediately and forward content deltas as they arrive; heartbeat comments remain only as idle keepalives.
 
 ### Grok Build cannot find the model
 
