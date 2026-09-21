@@ -22,6 +22,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 DEFAULT_BACKEND_URL = "https://api2.cursor.sh"
@@ -34,9 +35,32 @@ DEFAULT_CLIENT_VERSION = "0.30.0"
 DEFAULT_NAMESPACE = "prod"
 
 # src/shared/agents/agent-model.ts
-DEFAULT_MODEL_ID = "grok-4.5"
+DEFAULT_MODEL_ID = "grok-4.6"
 DEFAULT_MAX_MODE = False
 DEFAULT_MODEL_PARAMS = (("effort", "high"), ("fast", "true"))
+
+SECRETS_ENV_FILE = Path(
+    os.environ.get("GROKBOT_SECRETS_FILE") or (Path.home() / ".omp/agent/secrets/grokbot.env")
+)
+
+
+def read_secrets_file() -> dict[str, str]:
+    """omp's grokbot secrets file (SAND_INFERENCE_RENEWAL_CREDENTIAL + GROKBOT_MACHINE_ID).
+
+    Keeps one source of truth: process env wins, this file is the fallback so the bridge can be
+    started by a supervisor unit without duplicating secrets into unit config.
+    """
+    out: dict[str, str] = {}
+    try:
+        for line in SECRETS_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return out
 
 REFRESH_LEEWAY_MS = 2 * 60 * 1000
 DEFAULT_TTL_MS = 10 * 60 * 1000
@@ -188,6 +212,39 @@ def iter_envelopes_from_bytes(raw: bytes) -> list[tuple[int, bytes]]:
     return chunks
 
 
+def read_exactly(fp, count: int) -> bytes:
+    """Read exactly ``count`` bytes from ``fp``, or fewer at end of stream."""
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = fp.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def iter_envelopes_from_fp(fp) -> Iterator[tuple[int, bytes]]:
+    """Yield (flags, payload) as each Connect envelope arrives on ``fp``.
+
+    Same framing as :func:`iter_envelopes_from_bytes` — one flag byte, a 4-byte
+    big-endian length, then the payload — but this one never waits for end of
+    stream, so the bridge can forward a delta the moment upstream emits it. A
+    truncated trailing envelope is dropped, exactly as the buffered reader drops
+    it.
+    """
+    while True:
+        header = read_exactly(fp, 5)
+        if len(header) < 5:
+            return
+        length = int.from_bytes(header[1:5], "big")
+        payload = read_exactly(fp, length)
+        if len(payload) < length:
+            return
+        yield header[0], payload
+
+
 def enhanced_obfuscate(data: bytearray) -> bytes:
     last = 165
     for i in range(len(data)):
@@ -218,6 +275,8 @@ def load_machine_id() -> str:
     # GROKBOT_MACHINE_ID is the name the packaged Grok Bot clients and companion providers use
     # for the same value; accept it as an alias so both wiring styles work.
     override = (os.environ.get("SAND_MACHINE_ID") or os.environ.get("GROKBOT_MACHINE_ID") or "").strip()
+    if not override:
+        override = (read_secrets_file().get("GROKBOT_MACHINE_ID") or "").strip()
     if override:
         return override
 
@@ -317,10 +376,13 @@ def write_cache(path: Path, access_token: str, expires_at_ms: int, conversation_
 
 
 def load_renewal_credential(args) -> str:
-    env = (os.environ.get(CREDENTIAL_ENV) or "").strip()
+    env = (os.environ.get(CREDENTIAL_ENV) or os.environ.get("GROKBOT_RENEWAL_CREDENTIAL") or "").strip()
+    if not env:
+        secrets = read_secrets_file()
+        env = (secrets.get(CREDENTIAL_ENV) or secrets.get("GROKBOT_RENEWAL_CREDENTIAL") or "").strip()
     if env:
         return env
-    raise SystemExit(f"set {CREDENTIAL_ENV} before starting the client")
+    raise SystemExit(f"set {CREDENTIAL_ENV} (or write {SECRETS_ENV_FILE}) before starting the client")
 
 
 def default_conversation_id() -> str:

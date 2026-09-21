@@ -18,7 +18,7 @@ import grokbot2api as bridge  # noqa: E402
 class FakeBackend:
     options = SimpleNamespace(model="grok-4.6")
 
-    def complete(self, model, messages, tools, request):
+    def complete(self, model, messages, tools, request, on_event=None):
         time.sleep(0.04)
         results = [message for message in messages if message.get("role") == "tool"]
         usage = {

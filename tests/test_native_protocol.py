@@ -1,4 +1,5 @@
 import json
+import struct
 import sys
 import tempfile
 import threading
@@ -38,24 +39,28 @@ class NativeProtocolTests(unittest.TestCase):
     def test_client_model_alias_routes_to_configured_upstream_model(self):
         backend = bridge.SandBackend.__new__(bridge.SandBackend)
         backend.options = SimpleNamespace(model="grok-4.6")
-        backend.args = SimpleNamespace(model="")
+        backend.args = SimpleNamespace(model="", conversation_id="conversation-1")
         backend.lock = threading.Lock()
+        backend.token_epoch = 0
         backend.module = SimpleNamespace(
             load_renewal_credential=lambda args: "credential",
             client_meta=lambda args: {},
             get_access_token=lambda args, credential, meta, force=False: {
-                "accessToken": "token"
+                "accessToken": "token",
+                "renewed": False,
             },
         )
 
-        def fake_native_stream(module, args, token, messages, tools, request):
+        def fake_native_stream(module, args, token, messages, tools, request, on_event=None):
             return {"ok": True, "model": args.model}
 
         with mock.patch.object(bridge, "native_stream_llm", side_effect=fake_native_stream):
             result = backend.infer_native("cursor-grok-4-6", [], [], {})
 
         self.assertEqual(result["model"], "grok-4.6")
-        self.assertEqual(backend.args.model, "grok-4.6")
+        # The shared namespace is read-only now: routing happens on a per-request
+        # copy, which is what makes lock-free inference safe.
+        self.assertEqual(backend.args.model, "")
 
     def test_request_contains_messages_tools_and_requested_model(self):
         messages = [
@@ -208,6 +213,34 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertIn("command:string required", hint)
         self.assertIn("timeout:integer optional", hint)
         self.assertLessEqual(len(hint), 1800)
+
+    @staticmethod
+    def encoded_model_config(request):
+        encoded = bridge.encode_native_request(
+            upstream,
+            [{"role": "user", "content": "hello"}],
+            [],
+            "grok-4.6",
+            "invocation-1",
+            "conversation-1",
+            False,
+            request,
+        )
+        outer, _ = upstream.pb_decode(encoded)
+        return outer.get(4, [])
+
+    def test_max_tokens_16_is_not_forwarded(self):
+        self.assertEqual(self.encoded_model_config({"max_tokens": 16}), [])
+
+    def test_max_tokens_512_is_not_forwarded(self):
+        self.assertEqual(self.encoded_model_config({"max_tokens": 512}), [])
+
+    def test_other_model_config_survives_while_max_tokens_is_omitted(self):
+        configs = self.encoded_model_config({"max_tokens": 16, "temperature": 0.25})
+        self.assertEqual(len(configs), 1)
+        config, _ = upstream.pb_decode(configs[0])
+        self.assertNotIn(1, config, "field 1 is max_tokens and must never be sent")
+        self.assertEqual(struct.unpack("<f", config[2][0])[0], 0.25)
 
 
 if __name__ == "__main__":
