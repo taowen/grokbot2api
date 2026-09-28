@@ -22,6 +22,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 DEFAULT_BACKEND_URL = "https://api2.cursor.sh"
@@ -34,9 +35,32 @@ DEFAULT_CLIENT_VERSION = "0.30.0"
 DEFAULT_NAMESPACE = "prod"
 
 # src/shared/agents/agent-model.ts
-DEFAULT_MODEL_ID = "grok-4.5"
+DEFAULT_MODEL_ID = "grok-4.7"
 DEFAULT_MAX_MODE = False
 DEFAULT_MODEL_PARAMS = (("effort", "high"), ("fast", "true"))
+
+SECRETS_ENV_FILE = Path(
+    os.environ.get("GROKBOT_SECRETS_FILE") or (Path.home() / ".omp/agent/secrets/grokbot.env")
+)
+
+
+def read_secrets_file() -> dict[str, str]:
+    """omp's grokbot secrets file (SAND_INFERENCE_RENEWAL_CREDENTIAL + GROKBOT_MACHINE_ID).
+
+    Keeps one source of truth: process env wins, this file is the fallback so the bridge can be
+    started by a supervisor unit without duplicating secrets into unit config.
+    """
+    out: dict[str, str] = {}
+    try:
+        for line in SECRETS_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return out
 
 REFRESH_LEEWAY_MS = 2 * 60 * 1000
 DEFAULT_TTL_MS = 10 * 60 * 1000
@@ -188,6 +212,39 @@ def iter_envelopes_from_bytes(raw: bytes) -> list[tuple[int, bytes]]:
     return chunks
 
 
+def read_exactly(fp, count: int) -> bytes:
+    """Read exactly ``count`` bytes from ``fp``, or fewer at end of stream."""
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = fp.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def iter_envelopes_from_fp(fp) -> Iterator[tuple[int, bytes]]:
+    """Yield (flags, payload) as each Connect envelope arrives on ``fp``.
+
+    Same framing as :func:`iter_envelopes_from_bytes` — one flag byte, a 4-byte
+    big-endian length, then the payload — but this one never waits for end of
+    stream, so the bridge can forward a delta the moment upstream emits it. A
+    truncated trailing envelope is dropped, exactly as the buffered reader drops
+    it.
+    """
+    while True:
+        header = read_exactly(fp, 5)
+        if len(header) < 5:
+            return
+        length = int.from_bytes(header[1:5], "big")
+        payload = read_exactly(fp, length)
+        if len(payload) < length:
+            return
+        yield header[0], payload
+
+
 def enhanced_obfuscate(data: bytearray) -> bytes:
     last = 165
     for i in range(len(data)):
@@ -215,7 +272,9 @@ def cursor_checksum(machine_id: str) -> str:
 
 
 def load_machine_id() -> str:
-    override = (os.environ.get("SAND_MACHINE_ID") or "").strip()
+    override = (os.environ.get("SAND_MACHINE_ID") or os.environ.get("GROKBOT_MACHINE_ID") or "").strip()
+    if not override:
+        override = (read_secrets_file().get("GROKBOT_MACHINE_ID") or "").strip()
     if override:
         return override
 
@@ -289,12 +348,21 @@ def read_cache(path: Path) -> dict | None:
         return None
 
 
-def write_cache(path: Path, access_token: str, expires_at_ms: int, conversation_id: str | None = None) -> None:
+def write_cache(
+    path: Path,
+    access_token: str,
+    expires_at_ms: int,
+    conversation_id: str | None = None,
+    session_token: str | None = None,
+) -> None:
     payload: dict = {"accessToken": access_token, "expiresAtMs": expires_at_ms}
     prev = read_cache(path) or {}
     cid = conversation_id or prev.get("conversationId")
     if isinstance(cid, str) and cid:
         payload["conversationId"] = cid
+    session = session_token or prev.get("sessionToken")
+    if isinstance(session, str) and session:
+        payload["sessionToken"] = session
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
@@ -315,10 +383,13 @@ def write_cache(path: Path, access_token: str, expires_at_ms: int, conversation_
 
 
 def load_renewal_credential(args) -> str:
-    env = (os.environ.get(CREDENTIAL_ENV) or "").strip()
+    env = (os.environ.get(CREDENTIAL_ENV) or os.environ.get("GROKBOT_RENEWAL_CREDENTIAL") or "").strip()
+    if not env:
+        secrets = read_secrets_file()
+        env = (secrets.get(CREDENTIAL_ENV) or secrets.get("GROKBOT_RENEWAL_CREDENTIAL") or "").strip()
     if env:
         return env
-    raise SystemExit(f"set {CREDENTIAL_ENV} before starting the client")
+    raise SystemExit(f"set {CREDENTIAL_ENV} (or write {SECRETS_ENV_FILE}) before starting the client")
 
 
 def default_conversation_id() -> str:
@@ -349,26 +420,292 @@ def renew(credential: str, backend_url: str, meta: dict[str, str]) -> dict:
             parsed = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise SystemExit(f"renewal failed HTTP {e.code}: {e.read().decode('utf-8','replace')[:500]}") from e
-    token = parsed.get("accessToken") if isinstance(parsed, dict) else None
+    # The sand exchange returns TWO tokens: accessToken (type: session) and grokBotToken
+    # (type: grok_bot). Only grokBotToken authenticates aiserver.v1.InferenceService/Stream —
+    # measured on 2026-09-15: accessToken yields ERROR_NOT_LOGGED_IN, grokBotToken streams.
+    # STRICT: no fallback to the session token. A silent fallback would turn a missing/renamed
+    # field into "every request fails with ERROR_NOT_LOGGED_IN"; fail loudly and name the field.
+    token = None
+    if isinstance(parsed, dict):
+        for field in ("grokBotToken", "grok_bot_token"):
+            candidate = parsed.get(field)
+            if isinstance(candidate, str) and candidate:
+                token = candidate
+                break
     if not isinstance(token, str) or not token:
-        raise SystemExit("renewal returned no accessToken")
+        keys = sorted(parsed.keys()) if isinstance(parsed, dict) else []
+        raise SystemExit(
+            "renewal returned no grokBotToken (response keys: "
+            f"{keys}); refusing to fall back to the session token"
+        )
     exp = parsed.get("expiresAtMs")
     if not isinstance(exp, (int, float)):
         exp = jwt_exp_ms(token) or (now_ms() + DEFAULT_TTL_MS)
-    return {"accessToken": token, "expiresAtMs": int(exp), "renewed": True}
+    return {"accessToken": token, "expiresAtMs": int(exp), "renewed": True, "sessionToken": (parsed.get("accessToken") if isinstance(parsed, dict) else None)}
+
+
+# Sand usage/allowance status. Lives on the Dashboard service, is an empty request message, and —
+# unlike inference — authenticates with the SESSION token (accessToken), not grokBotToken:
+#   measured 2026-09-15: accessToken -> 200, grokBotToken -> 401 ERROR_NOT_LOGGED_IN.
+SAND_USAGE_PATH = "/aiserver.v1.DashboardService/GetSandUsageStatus"
+
+
+def fetch_sand_usage(
+    credential: str,
+    backend_url: str,
+    meta: dict[str, str],
+    machine_id: str,
+    timeout_ms: int = 30000,
+) -> dict:
+    """Mint a session token and read the sand weekly allowance status.
+
+    Returns the upstream fields (usagePercent is USED, not remaining) plus
+    usageRemainingPercent, or {"error": ...} — never raises for callers that want a soft surface.
+    """
+    try:
+        minted = renew(credential, backend_url, meta)
+    except SystemExit as e:
+        return {"error": str(e)}
+    session = minted.get("sessionToken")
+    if not isinstance(session, str) or not session:
+        return {"error": "renewal returned no session token for usage lookup"}
+    url = backend_url.rstrip("/") + SAND_USAGE_PATH
+    headers = {
+        "authorization": f"Bearer {session}",
+        "content-type": "application/json",
+        "connect-protocol-version": "1",
+        "connect-timeout-ms": str(timeout_ms),
+        "x-cursor-checksum": cursor_checksum(machine_id),
+        **meta,
+    }
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_ms / 1000) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"error": f"usage lookup HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"usage lookup {type(e).__name__}: {e}"}
+    if not isinstance(data, dict):
+        return {"error": "usage lookup returned a non-object payload"}
+    used = data.get("usagePercent")
+    out = {
+        "usagePercent": used,
+        "usageRemainingPercent": round(100 - float(used), 3) if isinstance(used, (int, float)) else None,
+        "currentPeriodStart": data.get("currentPeriodStart"),
+        "nextResetTimestampUtc": data.get("nextResetTimestampUtc"),
+        "hasAvailableUsage": data.get("hasAvailableUsage"),
+        "hasNonZeroIncludedLimit": data.get("hasNonZeroIncludedLimit"),
+        "availableBankedResetCount": data.get("availableBankedResetCount"),
+        "usesPooledEnterpriseAllowance": data.get("usesPooledEnterpriseAllowance"),
+        "grokPlanLabel": data.get("grokPlanLabel"),
+        "cursorPlanName": data.get("cursorPlanName"),
+    }
+    ondemand = data.get("onDemandSettings")
+    if isinstance(ondemand, dict):
+        out["onDemandDashboardUrl"] = ondemand.get("dashboardUrl")
+    return out
 
 
 def get_access_token(args, credential: str, meta: dict[str, str], force: bool = False) -> dict:
     cached = None if force else read_cache(args.cache)
-    if cached and cache_valid(cached):
+    if cached and cache_valid(cached) and isinstance(cached.get("sessionToken"), str) and cached["sessionToken"]:
         return {
             "accessToken": cached["accessToken"],
             "expiresAtMs": int(cached["expiresAtMs"]),
             "renewed": False,
+            "sessionToken": cached["sessionToken"],
         }
     got = renew(credential, args.backend_url, meta)
-    write_cache(args.cache, got["accessToken"], got["expiresAtMs"], args.conversation_id)
+    write_cache(
+        args.cache,
+        got["accessToken"],
+        got["expiresAtMs"],
+        args.conversation_id,
+        session_token=got.get("sessionToken") if isinstance(got.get("sessionToken"), str) else None,
+    )
     return got
+
+GROKBOT_SERVICE = "/aiserver.v1.GrokBotService"
+
+
+def grokbot_json_headers(args, session_token: str, machine_id: str) -> dict[str, str]:
+    return {
+        "authorization": f"Bearer {session_token}",
+        "content-type": "application/json",
+        "connect-protocol-version": "1",
+        "x-cursor-checksum": cursor_checksum(machine_id),
+        **client_meta(args),
+    }
+
+
+def grokbot_rpc(args, session_token: str, method: str, body: dict, timeout_s: float = 25) -> dict:
+    url = args.backend_url.rstrip("/") + f"{GROKBOT_SERVICE}/{method}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers=grokbot_json_headers(args, session_token, load_machine_id()),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            parsed = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"{method} HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+        ) from e
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{method} returned a non-object")
+    return parsed
+
+
+def last_user_text(messages: list) -> str:
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text") or ""))
+            text = "".join(parts).strip()
+            if text:
+                return text
+    raise RuntimeError("no user text to send to Grok Bot")
+
+
+def decode_transcript_body(body: object) -> dict | None:
+    if not isinstance(body, str) or not body:
+        return None
+    import base64
+
+    try:
+        parsed = json.loads(base64.b64decode(body))
+    except Exception:
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def transcript_text(parsed: dict | None) -> str:
+    if not isinstance(parsed, dict):
+        return ""
+    message = parsed.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    if isinstance(parsed.get("content"), str):
+        return parsed["content"]
+    return ""
+
+
+def resolve_grokbot_agent(args, session_token: str) -> dict:
+    override = (os.environ.get("GROKBOT_AGENT_ID") or "").strip()
+    payload = grokbot_rpc(args, session_token, "ListGrokBotAgents", {})
+    agents = payload.get("agents") if isinstance(payload.get("agents"), list) else []
+    if override:
+        for agent in agents:
+            if isinstance(agent, dict) and str(agent.get("id") or "") == override:
+                return agent
+        raise RuntimeError(f"GROKBOT_AGENT_ID={override} is not in ListGrokBotAgents")
+    if not agents or not isinstance(agents[0], dict):
+        raise RuntimeError("ListGrokBotAgents returned no agents")
+    return agents[0]
+
+
+def send_grokbot_user_message(
+    args,
+    session_token: str,
+    messages: list,
+    timeout_s: float = 90,
+    on_event=None,
+) -> dict:
+    """Dispatch one user turn through GrokBotService and wait for the assistant row.
+
+    Measured 2026-09-28: InferenceService/Stream returns ERROR_NOT_HIGH_ENOUGH_PERMISSIONS
+    even from inside the sand VM. Live Grok Bot chat uses SendGrokBotUserMessage with the
+    session token, then ListGrokBotTranscriptEntries on the agent's legacyAgentId.
+    """
+    prompt = last_user_text(messages)
+    agent = resolve_grokbot_agent(args, session_token)
+    numeric_id = str(agent.get("id") or "")
+    legacy_id = str(agent.get("legacyAgentId") or numeric_id)
+    if not numeric_id:
+        raise RuntimeError("Grok Bot agent has no id")
+    listed = grokbot_rpc(
+        args, session_token, "ListGrokBotTranscriptEntries", {"agentId": legacy_id, "limit": 5}
+    )
+    before = 0
+    for entry in listed.get("entries") or []:
+        try:
+            before = max(before, int(entry.get("seq") or 0))
+        except (TypeError, ValueError):
+            pass
+    message_id = str(uuid.uuid4())
+    send = grokbot_rpc(
+        args,
+        session_token,
+        "SendGrokBotUserMessage",
+        {
+            "agentId": numeric_id,
+            "messageId": message_id,
+            "text": prompt,
+            "sentAtMs": now_ms(),
+        },
+    )
+    if send.get("dispatched") is not True:
+        raise RuntimeError(f"SendGrokBotUserMessage did not dispatch: {send}")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        page = grokbot_rpc(
+            args,
+            session_token,
+            "ListGrokBotTranscriptEntries",
+            {"agentId": legacy_id, "limit": 30},
+        )
+        rows = sorted(page.get("entries") or [], key=lambda entry: int(entry.get("seq") or 0))
+        saw_user = False
+        for entry in rows:
+            try:
+                seq = int(entry.get("seq") or 0)
+            except (TypeError, ValueError):
+                continue
+            if seq <= before:
+                continue
+            parsed = decode_transcript_body(entry.get("body"))
+            kind = entry.get("entryKind") or entry.get("entry_kind")
+            text = transcript_text(parsed)
+            if kind == "message" and isinstance(parsed, dict) and parsed.get("role") == "user":
+                if prompt[:80] in text:
+                    saw_user = True
+                continue
+            if saw_user and kind == "send-message" and text.strip():
+                if on_event is not None:
+                    on_event({"type": "text", "text": text})
+                model = getattr(args, "model", DEFAULT_MODEL_ID)
+                return {
+                    "ok": True,
+                    "httpStatus": 200,
+                    "text": text,
+                    "tool_calls": [],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "extended_usage": {},
+                    "model": model,
+                    "modelId": model,
+                    "error": None,
+                    "agentId": numeric_id,
+                    "legacyAgentId": legacy_id,
+                    "messageId": message_id,
+                }
+        time.sleep(1.0)
+    raise RuntimeError(f"timed out waiting for Grok Bot reply after {timeout_s}s")
+
 
 
 def inference_headers(args, access_token: str, machine_id: str, request_id: str) -> dict[str, str]:

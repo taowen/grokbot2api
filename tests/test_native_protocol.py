@@ -1,4 +1,5 @@
 import json
+import struct
 import sys
 import tempfile
 import threading
@@ -24,7 +25,9 @@ class NativeProtocolTests(unittest.TestCase):
     def test_write_cache_on_current_platform(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "nested" / "token.json"
-            upstream.write_cache(cache, "access-token", 123456, "conversation-1")
+            upstream.write_cache(
+                cache, "access-token", 123456, "conversation-1", session_token="session-token"
+            )
 
             self.assertEqual(
                 json.loads(cache.read_text()),
@@ -32,30 +35,94 @@ class NativeProtocolTests(unittest.TestCase):
                     "accessToken": "access-token",
                     "expiresAtMs": 123456,
                     "conversationId": "conversation-1",
+                    "sessionToken": "session-token",
                 },
             )
 
     def test_client_model_alias_routes_to_configured_upstream_model(self):
         backend = bridge.SandBackend.__new__(bridge.SandBackend)
         backend.options = SimpleNamespace(model="grok-4.6")
-        backend.args = SimpleNamespace(model="")
+        backend.args = SimpleNamespace(model="", conversation_id="conversation-1", timeout_ms=30000)
         backend.lock = threading.Lock()
+        backend.token_epoch = 0
+        seen = {}
+
+        def send(args, session, messages, timeout_s=90, on_event=None):
+            seen["model"] = args.model
+            seen["session"] = session
+            seen["timeout_s"] = timeout_s
+            return {"ok": True, "model": args.model, "text": "pong"}
+
         backend.module = SimpleNamespace(
             load_renewal_credential=lambda args: "credential",
             client_meta=lambda args: {},
             get_access_token=lambda args, credential, meta, force=False: {
-                "accessToken": "token"
+                "accessToken": "bot-token",
+                "sessionToken": "session-token",
+                "renewed": False,
             },
+            send_grokbot_user_message=send,
         )
+        result = backend.infer_native("cursor-grok-4-6", [{"role": "user", "content": "hi"}], [], {})
+        self.assertEqual(result["model"], "cursor-grok-4-6")
+        self.assertEqual(seen["session"], "session-token")
+        self.assertEqual(backend.args.model, "")
 
-        def fake_native_stream(module, args, token, messages, tools, request):
-            return {"ok": True, "model": args.model}
+    def test_send_grokbot_user_message_polls_legacy_transcript(self):
+        calls = []
 
-        with mock.patch.object(bridge, "native_stream_llm", side_effect=fake_native_stream):
-            result = backend.infer_native("cursor-grok-4-6", [], [], {})
+        def rpc(args, session, method, body, timeout_s=25):
+            calls.append((method, body))
+            if method == "ListGrokBotAgents":
+                return {
+                    "agents": [
+                        {
+                            "id": "2644902",
+                            "legacyAgentId": "legacy-1",
+                            "name": "Dining Concierge",
+                        }
+                    ]
+                }
+            if method == "ListGrokBotTranscriptEntries":
+                listed = [c for c in calls if c[0] == "ListGrokBotTranscriptEntries"]
+                if len(listed) == 1:
+                    return {"entries": [{"seq": "10", "entryKind": "send-message", "body": ""}]}
+                import base64
 
-        self.assertEqual(result["model"], "grok-4.6")
-        self.assertEqual(backend.args.model, "grok-4.6")
+                user = base64.b64encode(
+                    json.dumps(
+                        {"kind": "message", "role": "user", "content": "ping-xyz"}
+                    ).encode()
+                ).decode()
+                reply = base64.b64encode(
+                    json.dumps(
+                        {
+                            "kind": "send-message",
+                            "message": {"type": "text", "content": "pong-xyz"},
+                        }
+                    ).encode()
+                ).decode()
+                return {
+                    "entries": [
+                        {"seq": "11", "entryKind": "message", "body": user},
+                        {"seq": "12", "entryKind": "send-message", "body": reply},
+                    ]
+                }
+            if method == "SendGrokBotUserMessage":
+                return {"dispatched": True}
+            raise AssertionError(method)
+
+        with mock.patch.object(upstream, "grokbot_rpc", side_effect=rpc):
+            result = upstream.send_grokbot_user_message(
+                SimpleNamespace(backend_url="https://api2.cursor.sh", model="grok-4.6"),
+                "session-token",
+                [{"role": "user", "content": "ping-xyz"}],
+                timeout_s=5,
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["text"], "pong-xyz")
+        self.assertEqual([c[0] for c in calls if c[0] == "SendGrokBotUserMessage"], ["SendGrokBotUserMessage"])
+        self.assertEqual(calls[0][0], "ListGrokBotAgents")
 
     def test_request_contains_messages_tools_and_requested_model(self):
         messages = [
@@ -208,6 +275,34 @@ class NativeProtocolTests(unittest.TestCase):
         self.assertIn("command:string required", hint)
         self.assertIn("timeout:integer optional", hint)
         self.assertLessEqual(len(hint), 1800)
+
+    @staticmethod
+    def encoded_model_config(request):
+        encoded = bridge.encode_native_request(
+            upstream,
+            [{"role": "user", "content": "hello"}],
+            [],
+            "grok-4.6",
+            "invocation-1",
+            "conversation-1",
+            False,
+            request,
+        )
+        outer, _ = upstream.pb_decode(encoded)
+        return outer.get(4, [])
+
+    def test_max_tokens_16_is_not_forwarded(self):
+        self.assertEqual(self.encoded_model_config({"max_tokens": 16}), [])
+
+    def test_max_tokens_512_is_not_forwarded(self):
+        self.assertEqual(self.encoded_model_config({"max_tokens": 512}), [])
+
+    def test_other_model_config_survives_while_max_tokens_is_omitted(self):
+        configs = self.encoded_model_config({"max_tokens": 16, "temperature": 0.25})
+        self.assertEqual(len(configs), 1)
+        config, _ = upstream.pb_decode(configs[0])
+        self.assertNotIn(1, config, "field 1 is max_tokens and must never be sent")
+        self.assertEqual(struct.unpack("<f", config[2][0])[0], 0.25)
 
 
 if __name__ == "__main__":
